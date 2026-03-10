@@ -95,8 +95,9 @@ __global__ void rope_inplace_kernel(half* q_or_k, int num_heads, int head_dim, i
   int d = idx % (head_dim / 2);
 
   int base = h * head_dim;
-  int d0 = 2 * d;
-  int d1 = d0 + 1;
+  int half_dim = head_dim / 2;
+  int d0 = d;
+  int d1 = d + half_dim;
 
   float x0 = __half2float(q_or_k[base + d0]);
   float x1 = __half2float(q_or_k[base + d1]);
@@ -107,101 +108,14 @@ __global__ void rope_inplace_kernel(half* q_or_k, int num_heads, int head_dim, i
   float c = cosf(angle);
   float s = sinf(angle);
 
+  // 与 transformers 的 rotate_half 保持一致: [x1, x2] -> [-x2, x1]
   float y0 = x0 * c - x1 * s;
-  float y1 = x0 * s + x1 * c;
+  float y1 = x1 * c + x0 * s;
 
   q_or_k[base + d0] = __float2half(y0);
   q_or_k[base + d1] = __float2half(y1);
 }
 
-__global__ void attention_scores_kernel(const half* q, const half* k_cache, int num_heads, int num_kv_heads,
-                                        int head_dim, int seq_len, float* scores) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = num_heads * seq_len;
-  if (idx >= total) {
-    return;
-  }
-  int h = idx / seq_len;
-  int t = idx % seq_len;
-
-  int group = num_heads / num_kv_heads;
-  int kv_h = h / group;
-
-  const half* qh = q + h * head_dim;
-  const half* kh = k_cache + (t * num_kv_heads + kv_h) * head_dim;
-
-  float dot = 0.0f;
-  for (int i = 0; i < head_dim; ++i) {
-    dot += __half2float(qh[i]) * __half2float(kh[i]);
-  }
-  scores[idx] = dot / sqrtf(static_cast<float>(head_dim));
-}
-
-__global__ void softmax_rows_kernel(float* scores, int rows, int cols) {
-  int row = blockIdx.x;
-  if (row >= rows) {
-    return;
-  }
-
-  __shared__ float sdata[256];
-  float local_max = -CUDART_INF_F;
-  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-    local_max = fmaxf(local_max, scores[row * cols + i]);
-  }
-  sdata[threadIdx.x] = local_max;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + stride]);
-    }
-    __syncthreads();
-  }
-  float max_val = sdata[0];
-
-  float local_sum = 0.0f;
-  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-    float e = expf(scores[row * cols + i] - max_val);
-    scores[row * cols + i] = e;
-    local_sum += e;
-  }
-  sdata[threadIdx.x] = local_sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      sdata[threadIdx.x] += sdata[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-  float denom = sdata[0] + 1e-12f;
-
-  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-    scores[row * cols + i] /= denom;
-  }
-}
-
-__global__ void attention_context_kernel(const float* probs, const half* v_cache, int num_heads,
-                                         int num_kv_heads, int head_dim, int seq_len, half* context) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = num_heads * head_dim;
-  if (idx >= total) {
-    return;
-  }
-
-  int h = idx / head_dim;
-  int d = idx % head_dim;
-  int group = num_heads / num_kv_heads;
-  int kv_h = h / group;
-
-  float acc = 0.0f;
-  for (int t = 0; t < seq_len; ++t) {
-    float p = probs[h * seq_len + t];
-    float v = __half2float(v_cache[(t * num_kv_heads + kv_h) * head_dim + d]);
-    acc += p * v;
-  }
-  context[idx] = __float2half(acc);
-}
 
 __global__ void swiglu_kernel(const half* gate, const half* up, int n, half* out) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,6 +126,160 @@ __global__ void swiglu_kernel(const half* gate, const half* up, int n, half* out
   float u = __half2float(up[idx]);
   float sig = 1.0f / (1.0f + expf(-g));
   out[idx] = __float2half((g * sig) * u);
+}
+
+__global__ void flash_attention_kernel(const half* q, const half* k_cache, const half* v_cache,
+                                       int num_heads, int num_kv_heads, int head_dim, int seq_len,
+                                       half* context) {
+  int h = blockIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float* dot_buf = smem;
+  int tid = threadIdx.x;
+
+  int group = num_heads / num_kv_heads;
+  int kv_h = h / group;
+  const half* qh = q + h * head_dim;
+
+  // online softmax 统计量: m 为行最大值, l 为归一化分母
+  float m = -CUDART_INF_F;
+  float l = 0.0f;
+  float inv_scale = rsqrtf(static_cast<float>(head_dim));
+  int d0 = tid;
+  float acc = 0.0f;
+
+  for (int t = 0; t < seq_len; ++t) {
+    const half* kh = k_cache + (t * num_kv_heads + kv_h) * head_dim;
+    const half* vh = v_cache + (t * num_kv_heads + kv_h) * head_dim;
+
+    float partial = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      partial += __half2float(qh[d]) * __half2float(kh[d]);
+    }
+    dot_buf[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        dot_buf[tid] += dot_buf[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    // alpha/beta 用于把历史统计与当前 token 增量稳定融合
+    float alpha = 0.0f;
+    float beta = 0.0f;
+    if (tid == 0) {
+      float s = dot_buf[0] * inv_scale;
+      float new_m = fmaxf(m, s);
+      alpha = expf(m - new_m);
+      beta = expf(s - new_m);
+      m = new_m;
+      l = l * alpha + beta;
+      dot_buf[0] = alpha;
+      dot_buf[1] = beta;
+    }
+    __syncthreads();
+    alpha = dot_buf[0];
+    beta = dot_buf[1];
+
+    if (d0 < head_dim) {
+      float v = __half2float(vh[d0]);
+      acc = acc * alpha + beta * v;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    dot_buf[0] = l;
+  }
+  __syncthreads();
+  float inv_l = 1.0f / fmaxf(dot_buf[0], 1e-12f);
+  if (d0 < head_dim) {
+    context[h * head_dim + d0] = __float2half(acc * inv_l);
+  }
+}
+
+__global__ void paged_attention_kernel(const half* q, const half* k_cache, const half* v_cache,
+                                       const int* page_table, int page_size, int num_heads,
+                                       int num_kv_heads, int head_dim, int seq_len, half* context) {
+  int h = blockIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float* dot_buf = smem;
+  int tid = threadIdx.x;
+
+  int group = num_heads / num_kv_heads;
+  int kv_h = h / group;
+  const half* qh = q + h * head_dim;
+
+  float m = -CUDART_INF_F;
+  float l = 0.0f;
+  float inv_scale = rsqrtf(static_cast<float>(head_dim));
+  int d0 = tid;
+  float acc = 0.0f;
+
+  for (int t = 0; t < seq_len; ++t) {
+    // 将逻辑位置映射到物理页，模拟 paged KV cache 访问
+    int logical_page = t / page_size;
+    int page_offset = t % page_size;
+    int physical_page = page_table[logical_page];
+    int physical_t = physical_page * page_size + page_offset;
+
+    const half* kh = k_cache + (physical_t * num_kv_heads + kv_h) * head_dim;
+    const half* vh = v_cache + (physical_t * num_kv_heads + kv_h) * head_dim;
+
+    float partial = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      partial += __half2float(qh[d]) * __half2float(kh[d]);
+    }
+    dot_buf[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        dot_buf[tid] += dot_buf[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    float alpha = 0.0f;
+    float beta = 0.0f;
+    if (tid == 0) {
+      float s = dot_buf[0] * inv_scale;
+      float new_m = fmaxf(m, s);
+      alpha = expf(m - new_m);
+      beta = expf(s - new_m);
+      m = new_m;
+      l = l * alpha + beta;
+      dot_buf[0] = alpha;
+      dot_buf[1] = beta;
+    }
+    __syncthreads();
+    alpha = dot_buf[0];
+    beta = dot_buf[1];
+
+    if (d0 < head_dim) {
+      float v = __half2float(vh[d0]);
+      acc = acc * alpha + beta * v;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    dot_buf[0] = l;
+  }
+  __syncthreads();
+  float inv_l = 1.0f / fmaxf(dot_buf[0], 1e-12f);
+  if (d0 < head_dim) {
+    context[h * head_dim + d0] = __float2half(acc * inv_l);
+  }
 }
 
 }  // namespace
@@ -244,30 +312,29 @@ void launch_rope_inplace(half* q_or_k, int num_heads, int head_dim, int position
   rope_inplace_kernel<<<blocks, threads>>>(q_or_k, num_heads, head_dim, position, rope_theta);
 }
 
-void launch_attention_scores(const half* q, const half* k_cache, int num_heads, int num_kv_heads,
-                             int head_dim, int seq_len, float* scores) {
-  int total = num_heads * seq_len;
-  int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  attention_scores_kernel<<<blocks, threads>>>(q, k_cache, num_heads, num_kv_heads, head_dim, seq_len,
-                                               scores);
-}
-
-void launch_softmax_rows(float* scores, int rows, int cols) {
-  softmax_rows_kernel<<<rows, 256>>>(scores, rows, cols);
-}
-
-void launch_attention_context(const float* probs, const half* v_cache, int num_heads, int num_kv_heads,
-                              int head_dim, int seq_len, half* context) {
-  int total = num_heads * head_dim;
-  int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  attention_context_kernel<<<blocks, threads>>>(probs, v_cache, num_heads, num_kv_heads, head_dim,
-                                                seq_len, context);
-}
-
 void launch_swiglu(const half* gate, const half* up, int n, half* out) {
   int threads = 256;
   int blocks = (n + threads - 1) / threads;
   swiglu_kernel<<<blocks, threads>>>(gate, up, n, out);
+}
+
+void launch_flash_attention(const half* q, const half* k_cache, const half* v_cache, int num_heads,
+                            int num_kv_heads, int head_dim, int seq_len, half* context) {
+  int threads = 1;
+  while (threads < head_dim && threads < 256) {
+    threads <<= 1;
+  }
+  flash_attention_kernel<<<num_heads, threads, threads * static_cast<int>(sizeof(float))>>>(
+    q, k_cache, v_cache, num_heads, num_kv_heads, head_dim, seq_len, context);
+}
+
+void launch_paged_attention(const half* q, const half* k_cache, const half* v_cache,
+                            const int* page_table, int page_size, int num_heads, int num_kv_heads,
+                            int head_dim, int seq_len, half* context) {
+  int threads = 1;
+  while (threads < head_dim && threads < 256) {
+    threads <<= 1;
+  }
+  paged_attention_kernel<<<num_heads, threads, threads * static_cast<int>(sizeof(float))>>>(
+    q, k_cache, v_cache, page_table, page_size, num_heads, num_kv_heads, head_dim, seq_len, context);
 }

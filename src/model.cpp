@@ -11,9 +11,12 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -57,8 +60,62 @@ int argmax_host(const std::vector<half>& logits) {
   return best;
 }
 
+std::vector<std::pair<int, float>> topk_host(const std::vector<half>& logits, int k) {
+  if (k <= 0) {
+    return {};
+  }
+  std::vector<std::pair<int, float>> scored;
+  scored.reserve(logits.size());
+  for (int i = 0; i < static_cast<int>(logits.size()); ++i) {
+    scored.emplace_back(i, __half2float(logits[i]));
+  }
+  int keep = std::min<int>(k, static_cast<int>(scored.size()));
+  std::partial_sort(scored.begin(), scored.begin() + keep, scored.end(),
+                    [](const auto& a, const auto& b) { return a.second > b.second; });
+  scored.resize(keep);
+  return scored;
+}
+
+void print_step_topk(int step, const std::vector<half>& logits, int k) {
+  auto top = topk_host(logits, k);
+  std::cout << "step_topk[" << step << "]=";
+  for (std::size_t j = 0; j < top.size(); ++j) {
+    if (j > 0) {
+      std::cout << ',';
+    }
+    std::cout << top[j].first << ':' << std::fixed << std::setprecision(6) << top[j].second;
+  }
+  std::cout << "\n";
+}
+
+std::unordered_set<int> collect_blocked_ngrams(const std::vector<int>& generated, int ngram_size) {
+  std::unordered_set<int> blocked;
+  if (ngram_size <= 1 || static_cast<int>(generated.size()) < ngram_size) {
+    return blocked;
+  }
+
+  int prefix_len = ngram_size - 1;
+  int start = static_cast<int>(generated.size()) - prefix_len;
+  const int* prefix = generated.data() + start;
+
+  for (int i = 0; i + ngram_size <= static_cast<int>(generated.size()); ++i) {
+    bool match = true;
+    for (int j = 0; j < prefix_len; ++j) {
+      if (generated[i + j] != prefix[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      blocked.insert(generated[i + prefix_len]);
+    }
+  }
+  return blocked;
+}
+
 int sample_token(const std::vector<half>& logits, const std::vector<int>& generated, float temperature,
-                 int top_k, float top_p, float min_p, float repetition_penalty) {
+                 int top_k, float top_p, float min_p, int no_repeat_ngram_size,
+                 float presence_penalty, float frequency_penalty, float repetition_penalty) {
   if (temperature <= 1e-5f) {
     return argmax_host(logits);
   }
@@ -71,7 +128,39 @@ int sample_token(const std::vector<half>& logits, const std::vector<int>& genera
   if (repetition_penalty > 1.0f) {
     for (int tok : generated) {
       if (tok >= 0 && tok < static_cast<int>(adjusted.size())) {
-        adjusted[tok] /= repetition_penalty;
+        if (adjusted[tok] > 0.0f) {
+          adjusted[tok] /= repetition_penalty;
+        } else {
+          adjusted[tok] *= repetition_penalty;
+        }
+      }
+    }
+  }
+
+  if (presence_penalty > 0.0f || frequency_penalty > 0.0f) {
+    std::unordered_map<int, int> freq;
+    for (int tok : generated) {
+      if (tok >= 0 && tok < static_cast<int>(adjusted.size())) {
+        ++freq[tok];
+      }
+    }
+    for (const auto& kv : freq) {
+      float penalty = 0.0f;
+      if (presence_penalty > 0.0f) {
+        penalty += presence_penalty;
+      }
+      if (frequency_penalty > 0.0f) {
+        penalty += frequency_penalty * static_cast<float>(kv.second);
+      }
+      adjusted[kv.first] -= penalty;
+    }
+  }
+
+  if (no_repeat_ngram_size > 0) {
+    auto blocked = collect_blocked_ngrams(generated, no_repeat_ngram_size);
+    for (int tok : blocked) {
+      if (tok >= 0 && tok < static_cast<int>(adjusted.size())) {
+        adjusted[tok] = -1e30f;
       }
     }
   }
@@ -274,7 +363,6 @@ bool QwenMiniModel::alloc_runtime() {
   CUDA_CHECK(cudaMalloc(&q_, q_dim * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&k_, kv_dim * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&v_, kv_dim * sizeof(half)));
-  CUDA_CHECK(cudaMalloc(&attn_scores_, cfg_.num_heads * cfg_.max_seq_len * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&context_, q_dim * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&ffn_gate_, inter * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&ffn_up_, inter * sizeof(half)));
@@ -286,6 +374,15 @@ bool QwenMiniModel::alloc_runtime() {
     CUDA_CHECK(cudaMalloc(&caches_[i].k, cfg_.max_seq_len * kv_dim * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&caches_[i].v, cfg_.max_seq_len * kv_dim * sizeof(half)));
   }
+
+  int max_pages = (cfg_.max_seq_len + page_size_ - 1) / page_size_;
+  page_table_host_.resize(max_pages);
+  for (int i = 0; i < max_pages; ++i) {
+    page_table_host_[i] = i;
+  }
+  CUDA_CHECK(cudaMalloc(&page_table_dev_, max_pages * sizeof(int)));
+  CUDA_CHECK(cudaMemcpy(page_table_dev_, page_table_host_.data(), max_pages * sizeof(int),
+                        cudaMemcpyHostToDevice));
   return true;
 }
 
@@ -325,13 +422,16 @@ void QwenMiniModel::free_all() {
   }
   caches_.clear();
 
+  safe_free(page_table_dev_);
+  page_table_dev_ = nullptr;
+  page_table_host_.clear();
+
   safe_free(x_);
   safe_free(x_norm_);
   safe_free(x_resid_);
   safe_free(q_);
   safe_free(k_);
   safe_free(v_);
-  safe_free(attn_scores_);
   safe_free(context_);
   safe_free(ffn_gate_);
   safe_free(ffn_up_);
@@ -344,7 +444,6 @@ void QwenMiniModel::free_all() {
   q_ = nullptr;
   k_ = nullptr;
   v_ = nullptr;
-  attn_scores_ = nullptr;
   context_ = nullptr;
   ffn_gate_ = nullptr;
   ffn_up_ = nullptr;
@@ -380,6 +479,7 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
   const int q_dim = cfg_.num_heads * head_dim;
   const int kv_dim = cfg_.num_kv_heads * head_dim;
 
+  // 1) 当前 token 的 embedding -> x
   launch_embedding_lookup(tok_embeddings_, cfg_.vocab_size, hidden, token_id, x_);
 
   for (int i = 0; i < cfg_.num_layers; ++i) {
@@ -403,17 +503,21 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
     launch_rope_inplace(q_, cfg_.num_heads, head_dim, position, cfg_.rope_theta);
     launch_rope_inplace(k_, cfg_.num_kv_heads, head_dim, position, cfg_.rope_theta);
 
+    // 2) 写入 KV cache，供后续自回归步复用
     CUDA_CHECK(cudaMemcpy(cache.k + static_cast<std::size_t>(position) * kv_dim, k_, kv_dim * sizeof(half),
                           cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(cache.v + static_cast<std::size_t>(position) * kv_dim, v_, kv_dim * sizeof(half),
                           cudaMemcpyDeviceToDevice));
 
+    // 3) 短序列走 FlashAttention，长序列走 PagedAttention
     int seq_len = position + 1;
-    launch_attention_scores(q_, cache.k, cfg_.num_heads, cfg_.num_kv_heads, head_dim, seq_len,
-                            attn_scores_);
-    launch_softmax_rows(attn_scores_, cfg_.num_heads, seq_len);
-    launch_attention_context(attn_scores_, cache.v, cfg_.num_heads, cfg_.num_kv_heads, head_dim, seq_len,
+    if (seq_len <= page_size_ * 8) {
+      launch_flash_attention(q_, cache.k, cache.v, cfg_.num_heads, cfg_.num_kv_heads, head_dim, seq_len,
                              context_);
+    } else {
+      launch_paged_attention(q_, cache.k, cache.v, page_table_dev_, page_size_, cfg_.num_heads,
+                             cfg_.num_kv_heads, head_dim, seq_len, context_);
+    }
 
     gemv(context_, w.wo, q_dim, hidden, x_);
     launch_add_inplace(x_, x_resid_, hidden);
@@ -428,6 +532,7 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
     launch_add_inplace(x_, x_resid_, hidden);
   }
 
+  // 4) 最终层归一化 + lm_head 输出 logits
   launch_rmsnorm(x_, final_norm_, hidden, cfg_.rms_norm_eps, x_norm_);
   gemv(x_norm_, lm_head_, hidden, cfg_.vocab_size, logits_);
 
@@ -442,7 +547,10 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
 std::vector<int> QwenMiniModel::generate(const std::vector<int>& input_ids, int max_new_tokens, int eos_id,
                                          float temperature, int top_k, float top_p,
                                          float min_p, float temp_decay, int greedy_after,
+                                         int no_repeat_ngram_size,
+                                         float presence_penalty, float frequency_penalty,
                                          float repetition_penalty,
+                                         int dump_topk, int dump_steps,
                                          float* elapsed_ms) {
   if (!loaded_) {
     throw std::runtime_error("Model not loaded");
@@ -470,11 +578,18 @@ std::vector<int> QwenMiniModel::generate(const std::vector<int>& input_ids, int 
   float temp_now = temperature;
   for (int i = 0; i < max_new_tokens; ++i) {
     (void)decode_next(cur, pos, &step_logits);
+
+    if (dump_topk > 0 && (dump_steps <= 0 || i < dump_steps)) {
+      print_step_topk(i, step_logits, dump_topk);
+    }
+
     int next = 0;
     if (greedy_after >= 0 && i >= greedy_after) {
       next = argmax_host(step_logits);
     } else {
-      next = sample_token(step_logits, all, temp_now, top_k, top_p, min_p, repetition_penalty);
+      next = sample_token(step_logits, all, temp_now, top_k, top_p, min_p,
+                          no_repeat_ngram_size, presence_penalty, frequency_penalty,
+                          repetition_penalty);
       if (temp_decay > 0.0f) {
         temp_now = std::max(0.05f, temp_now * temp_decay);
       }

@@ -33,7 +33,12 @@ class QwenMiniModel {
                             float min_p = 0.0f,
                             float temp_decay = 1.0f,
                             int greedy_after = -1,
+                            int no_repeat_ngram_size = 0,
+                            float presence_penalty = 0.0f,
+                            float frequency_penalty = 0.0f,
                             float repetition_penalty = 1.1f,
+                            int dump_topk = 0,
+                            int dump_steps = 0,
                             float* elapsed_ms = nullptr);
 
   const QwenMiniConfig& config() const { return cfg_; }
@@ -74,13 +79,16 @@ class QwenMiniModel {
 
   std::vector<LayerCache> caches_;
 
+  int* page_table_dev_ = nullptr;
+  std::vector<int> page_table_host_;
+  int page_size_ = 16;
+
   half* x_ = nullptr;
   half* x_norm_ = nullptr;
   half* x_resid_ = nullptr;
   half* q_ = nullptr;
   half* k_ = nullptr;
   half* v_ = nullptr;
-  float* attn_scores_ = nullptr;
   half* context_ = nullptr;
   half* ffn_gate_ = nullptr;
   half* ffn_up_ = nullptr;

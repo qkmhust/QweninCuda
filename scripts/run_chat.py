@@ -27,6 +27,9 @@ def main():
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--temp-decay", type=float, default=1.0)
     parser.add_argument("--greedy-after", type=int, default=-1)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=0)
+    parser.add_argument("--presence-penalty", type=float, default=0.0)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
     parser.add_argument("--repetition-penalty", type=float, default=1.1)
     args = parser.parse_args()
 
@@ -66,6 +69,12 @@ def main():
         str(args.temp_decay),
         "--greedy-after",
         str(args.greedy_after),
+        "--no-repeat-ngram-size",
+        str(args.no_repeat_ngram_size),
+        "--presence-penalty",
+        str(args.presence_penalty),
+        "--frequency-penalty",
+        str(args.frequency_penalty),
         "--repetition-penalty",
         str(args.repetition_penalty),
     ]
