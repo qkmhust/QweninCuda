@@ -14,12 +14,51 @@ def parse_generated_ids(output: str):
     return [int(x) for x in m.group(1).split(",") if x]
 
 
+def remove_think_block(text: str) -> str:
+    # 仅做展示层清洗，不影响模型真实输出 token。
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    # 部分模型会输出未闭合的 <think>，此时直接截断到标签前。
+    text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def build_input_ids(tokenizer, user_prompt: str, system_prompt: str) -> list[int]:
+    # 优先走 chat template，能显著提升指令跟随与回复格式稳定性。
+    if hasattr(tokenizer, "apply_chat_template"):
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            ids = tokenizer.apply_chat_template(
+                msgs,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            if isinstance(ids, list) and ids:
+                return ids
+        except Exception:
+            pass
+
+    # 回退：无模板时退化为普通 encode。
+    return tokenizer.encode(user_prompt, add_special_tokens=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local chat wrapper for qwen_minimal")
     parser.add_argument("--engine", default="./build/qwen_minimal")
     parser.add_argument("--weights", required=True, help="*.qmini")
     parser.add_argument("--model-dir", required=True, help="local qwen model dir for tokenizer")
     parser.add_argument("--prompt", default="你好，请用一句话介绍你自己。")
+    parser.add_argument(
+        "--system-prompt",
+        default=(
+            "你是一个严谨、友好的中文助手。"
+            "请直接给出最终答案，不输出推理过程，不输出<think>标签。"
+            "回答尽量简洁、准确、可执行。"
+        ),
+    )
+    parser.add_argument("--keep-think", action="store_true", help="Do not strip <think> block in displayed response")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=40)
@@ -44,7 +83,7 @@ def main():
         model_dir, trust_remote_code=True, local_files_only=True
     )
 
-    input_ids = tokenizer.encode(args.prompt, add_special_tokens=False)
+    input_ids = build_input_ids(tokenizer, args.prompt, args.system_prompt)
     input_ids_str = ",".join(str(x) for x in input_ids)
 
     cmd = [
@@ -85,7 +124,13 @@ def main():
 
     gen_ids = parse_generated_ids(out)
     new_part = gen_ids[len(input_ids):]
-    text = tokenizer.decode(new_part, skip_special_tokens=True)
+    raw_text = tokenizer.decode(new_part, skip_special_tokens=True)
+    text = raw_text
+    if not args.keep_think:
+        text = remove_think_block(text)
+        if not text.strip():
+            # 若模型只输出 think 段，给出可操作提示，避免展示污染文本。
+            text = "<模型仅输出了思维片段，建议改用更低 temperature 或设置 --greedy-after 0。>"
 
     print("=== prompt ===")
     print(args.prompt)

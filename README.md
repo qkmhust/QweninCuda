@@ -36,6 +36,23 @@ PY
 
 注意：ModelScope 会把目录中的特殊字符替换为下划线。
 
+## 2.1 提示词优化（提升输出质量）
+
+本仓库已在 `scripts/run_chat.py` 中默认启用：
+- `system prompt`：约束“只输出最终答案，不输出推理过程与 `<think>` 标签”。
+- `chat template`：优先走 tokenizer 的 `apply_chat_template`，提升对话模型指令遵循能力。
+- 展示层清洗：默认清理 `<think>...</think>` 片段，便于直接查看答案。
+
+建议参数（通用问答）：
+- `temperature=0.45~0.65`
+- `top-k=24~48`
+- `top-p=0.75~0.90`
+- `min-p=0.05~0.15`
+- `repetition-penalty=1.15~1.30`
+
+如果想看模型原始完整输出（包含思维片段），可加：
+- `--keep-think`
+
 ## 3. qmini v4 权重格式说明
 
 ### 3.1 头部字段顺序
@@ -176,6 +193,29 @@ PY
 - 乘 norm.weight 与 silu(z)
 - linear_out = out_proj(core_out): [hidden]
 
+## 4.1 Qwen3.5 新架构讲解（相对 Qwen3）
+
+Qwen3.5 的核心变化是“混合层”而不是“纯 attention 堆叠”：
+
+1. 层类型混合
+- Qwen3：通常每层都是 full-attention + MLP。
+- Qwen3.5：`layer_types` 显式区分 `linear_attention` 与 `full_attention`。
+
+2. full-attention 的 q_proj 变成双分支
+- Qwen3 常见：`q_proj -> [q_dim]`
+- Qwen3.5：`q_proj -> [2*q_dim]`，拆为 `query` 与 `gate`。
+- 注意力输出会乘 `sigmoid(gate)` 再进入 `o_proj`。
+
+3. linear-attention 的状态化递推
+- 每层维护 `conv_state`（卷积窗口状态）和 `recurrent_state`（记忆状态）。
+- decode 时每个新 token 仅更新状态，无需回看全部历史 K/V。
+- 这种结构在长上下文下可降低部分计算负担。
+
+4. 算子层面新增
+- depthwise causal conv
+- gated delta rule 递推更新
+- RMSNormGated
+
 ### Step 3: 残差连接
 
 - x <- residual + mixer_out
@@ -278,3 +318,64 @@ python3 scripts/qa5_smoke_test.py \
 3. 速度偏慢
 - 当前 linear-attention 递推为 C++ 标量实现，优先保证结构正确。
 - 后续可将 linear 递推与 conv 更新 CUDA 化。
+
+## 8. 不同参数模型差异与显存需求（学习与选型）
+
+### 8.1 显存估算公式
+
+推理显存可粗估为：
+
+$$
+	ext{VRAM}_{total} \approx \text{Weights} + \text{KV/State Cache} + \text{Runtime Buffers} + \text{Fragmentation}
+$$
+
+其中：
+
+1. 权重显存（FP16）
+$$
+	ext{Weights(GB)} \approx \frac{\text{ParamCount} \times 2}{1024^3}
+$$
+
+2. full-attention KV cache（单 batch）
+$$
+	ext{KV bytes} \approx 2 \times L_{full} \times T \times (n_{kv} \times d_h) \times 2
+$$
+- 第一个 `2`：K 和 V 两份
+- 最后一个 `2`：FP16 每元素 2 字节
+- `L_full`：full-attention 层数
+- `T`：上下文长度（token）
+
+3. linear-attention state（单 batch）
+- `conv_state` 与 `recurrent_state` 与序列长度弱相关或无关，通常小于权重占用。
+
+### 8.2 常见模型量级（经验值，单卡 FP16 推理）
+
+仅作学习选型参考，实际受实现、batch、上下文长度影响：
+
+1. 1.7B 级
+- 权重约 3.4~4.0 GB
+- 推荐显存：8~12 GB
+
+2. 4B 级（如 Qwen3.5-4B）
+- 权重约 8~10 GB
+- 推荐显存：16~24 GB
+
+3. 7B 级
+- 权重约 14~16 GB
+- 推荐显存：24~32 GB
+
+4. 14B 级
+- 权重约 28~32 GB
+- 推荐显存：40~48 GB 或多卡
+
+### 8.3 参数量增大时的学习重点
+
+1. hidden/intermediate 增大
+- GEMV/GEMM 开销近似按矩阵规模增长。
+
+2. 层数增大
+- decode 单步需要遍历更多层，时延近似线性上升。
+
+3. 上下文长度增大
+- full-attention 的 KV cache 线性增长。
+- linear-attention 更依赖固定状态更新，长上下文更有优势。
