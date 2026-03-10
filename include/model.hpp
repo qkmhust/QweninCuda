@@ -8,6 +8,7 @@
 #include <vector>
 
 struct QwenMiniConfig {
+  int32_t version = 0;
   int32_t vocab_size = 0;
   int32_t hidden_size = 0;
   int32_t intermediate_size = 0;
@@ -15,9 +16,15 @@ struct QwenMiniConfig {
   int32_t num_heads = 0;
   int32_t num_kv_heads = 0;
   int32_t head_dim = 0;
+  int32_t linear_num_key_heads = 0;
+  int32_t linear_num_value_heads = 0;
+  int32_t linear_key_head_dim = 0;
+  int32_t linear_value_head_dim = 0;
+  int32_t linear_conv_kernel_dim = 0;
   int32_t max_seq_len = 0;
   float rms_norm_eps = 1e-6f;
   float rope_theta = 1000000.0f;
+  std::vector<int32_t> layer_types;
 };
 
 class QwenMiniModel {
@@ -45,6 +52,8 @@ class QwenMiniModel {
 
  private:
   struct LayerWeights {
+    bool is_linear = false;
+
     half* attn_norm = nullptr;
     half* wq = nullptr;
     half* wk = nullptr;
@@ -52,6 +61,17 @@ class QwenMiniModel {
     half* q_norm = nullptr;
     half* k_norm = nullptr;
     half* wo = nullptr;
+
+    half* linear_in_qkv = nullptr;
+    half* linear_in_z = nullptr;
+    half* linear_in_b = nullptr;
+    half* linear_in_a = nullptr;
+    half* linear_conv1d_w = nullptr;
+    half* linear_dt_bias = nullptr;
+    half* linear_a_log = nullptr;
+    half* linear_norm_w = nullptr;
+    half* linear_out_proj = nullptr;
+
     half* ffn_norm = nullptr;
     half* w_gate = nullptr;
     half* w_up = nullptr;
@@ -61,6 +81,9 @@ class QwenMiniModel {
   struct LayerCache {
     half* k = nullptr;
     half* v = nullptr;
+
+    std::vector<float> linear_conv_state;
+    std::vector<float> linear_recurrent_state;
   };
 
   bool alloc_runtime();
@@ -90,6 +113,13 @@ class QwenMiniModel {
   half* k_ = nullptr;
   half* v_ = nullptr;
   half* context_ = nullptr;
+  half* q_gate_ = nullptr;
+
+  half* linear_mixed_qkv_ = nullptr;
+  half* linear_z_ = nullptr;
+  half* linear_b_ = nullptr;
+  half* linear_a_ = nullptr;
+  half* linear_out_ = nullptr;
   half* ffn_gate_ = nullptr;
   half* ffn_up_ = nullptr;
   half* ffn_hidden_ = nullptr;

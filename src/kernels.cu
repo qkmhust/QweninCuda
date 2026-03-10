@@ -93,6 +93,16 @@ __global__ void add_inplace_kernel(half* x, const half* y, int n) {
   }
 }
 
+__global__ void sigmoid_mul_inplace_kernel(half* x, const half* gate, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float g = __half2float(gate[idx]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    float xv = __half2float(x[idx]);
+    x[idx] = __float2half(xv * sig);
+  }
+}
+
 __global__ void rope_inplace_kernel(half* q_or_k, int num_heads, int head_dim, int position, float rope_theta) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = num_heads * (head_dim / 2);
@@ -311,6 +321,12 @@ void launch_add_inplace(half* x, const half* y, int n) {
   int threads = 256;
   int blocks = (n + threads - 1) / threads;
   add_inplace_kernel<<<blocks, threads>>>(x, y, n);
+}
+
+void launch_sigmoid_mul_inplace(half* x, const half* gate, int n) {
+  int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  sigmoid_mul_inplace_kernel<<<blocks, threads>>>(x, gate, n);
 }
 
 void launch_rope_inplace(half* q_or_k, int num_heads, int head_dim, int position, float rope_theta) {

@@ -1,165 +1,238 @@
-# Qwen3 CUDA Inference (C++20 + CUDA)
+# Qwen3/Qwen3.5 CUDA 本地离线推理
 
-本项目聚焦一件事：
-用 `C++20 + CUDA` 手写 Qwen3-1.7B 的核心推理链路，并把关键实现细节写清楚，方便学习和二次优化。
+本项目目标：
+- 用 C++20 + CUDA 实现单卡、单样本、自回归 decode。
+- 支持 Qwen3（纯 full-attention）与 Qwen3.5（linear + full 混合层）。
+- 权重格式统一为 qmini v4，严格保留官方结构，不做截断。
 
-## 1. 项目范围
+## 1. 项目结构
 
-当前仅聚焦单卡、单样本、自回归解码，不做训练与服务化。
+- src/main.cpp
+  - 命令行入口，解析生成参数。
+- src/model.cpp
+  - 模型加载、缓存分配、单步 decode 主流程。
+- src/kernels.cu
+  - CUDA 内核：embedding、RMSNorm、RoPE、Attention、SwiGLU 等。
+- include/model.hpp
+  - 配置结构、权重结构、运行时缓存结构。
+- scripts/convert_qwen3_to_qmini.py
+  - 从 HF/ModelScope 导出 qmini v4 权重。
+- scripts/run_chat.py
+  - 本地 tokenizer + C++ 引擎调用。
+- scripts/check_logits_alignment.py
+  - 与 HF 逐步 top-k/logits 对齐。
 
-包含内容：
-- Qwen3-1.7B 本地离线推理
-- 手写 CUDA 核心算子（RMSNorm / RoPE / FlashAttention / PagedAttention / SwiGLU）
-- cuBLAS 线性层（Q/K/V/O、MLP、lm_head）
-- 自定义二进制权重格式 `qmini(v3)` 与维度转换脚本
-- HF logits 对齐诊断脚本
+## 2. 模型下载（仅国内源）
 
-不包含内容：
-- Continuous batching
-- 张量并行/流水并行
-- 量化（INT8/FP8）
+示例：
 
-## 2. 目录说明
-
-- `src/main.cpp`: C++ 引擎入口与参数解析
-- `src/model.cpp`: 模型加载、前向主流程、采样
-- `src/kernels.cu`: 手写 CUDA kernel
-- `include/model.hpp`: 模型结构与接口声明
-- `include/kernels.cuh`: kernel 启动接口声明
-- `scripts/convert_qwen3_to_qmini.py`: 权重转换脚本（含 shape 严格校验）
-- `scripts/run_chat.py`: 纯推理调用包装（不做人为回答修正）
-- `scripts/check_logits_alignment.py`: HF 与本地 logits 对齐检查
-- `scripts/qa5_smoke_test.py`: 五问冒烟测试
-
-## 3. 环境要求
-
-- Linux + NVIDIA GPU
-- CUDA 12.x
-- CMake >= 3.22
-- g++ >= 11
-- Python >= 3.10
-
-安装依赖（国内镜像示例）：
-
-```bash
-python3 -m pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
-python3 -m pip install torch transformers modelscope safetensors accelerate -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-## 4. 模型下载与路径
-
-下载 Qwen3-1.7B（ModelScope）：
-
-```bash
 python3 - << 'PY'
 from modelscope.hub.snapshot_download import snapshot_download
-print(snapshot_download('Qwen/Qwen3-1.7B', cache_dir='/root/qwen3-cuda-minimal/ms_models'))
+print(snapshot_download('Qwen/Qwen3.5-4B', cache_dir='/root/QweninCuda/ms_models'))
 PY
-```
 
-推荐本地路径：
-- `/root/qwen3-cuda-minimal/ms_models/Qwen/Qwen3-1.7B`
+常见本地路径：
+- /root/QweninCuda/ms_models/Qwen/Qwen3___5-4B
 
-## 5. 数据格式与维度转换
+注意：ModelScope 会把目录中的特殊字符替换为下划线。
 
-### 5.1 qmini(v3) 头部
+## 3. qmini v4 权重格式说明
 
-按顺序写入：
-- magic: `QWENMINI`
-- version: `int32`
-- vocab_size, hidden_size, intermediate_size
-- num_layers, num_heads, num_kv_heads, head_dim
-- max_seq_len
-- rms_norm_eps, rope_theta
+### 3.1 头部字段顺序
 
-### 5.2 张量布局约定
+1. magic: QWENMINI
+2. version: int32（当前为 4）
+3. vocab_size, hidden_size, intermediate_size
+4. num_layers, num_heads, num_kv_heads, head_dim
+5. linear_num_key_heads, linear_num_value_heads
+6. linear_key_head_dim, linear_value_head_dim
+7. linear_conv_kernel_dim
+8. max_seq_len
+9. rms_norm_eps, rope_theta
+10. layer_types[num_layers]（0=full_attention, 1=linear_attention）
 
-1. embedding 表
-- 形状：`[vocab, hidden]`
-- 行主序直接写入
-- 不允许转置（embedding lookup 按 `table[token, dim]` 索引）
+### 3.2 各层权重布局
 
-2. 线性层权重
-- PyTorch 常见形状：`[out_dim, in_dim]`
-- 为匹配当前 C++ 侧 cuBLAS 调用约定，转换时写 `W.T`
-- C++ 读取时按 `out_dim * in_dim` 扁平加载
+1. full-attention 层
+- input_layernorm: [hidden]
+- q_proj: [2*q_dim, hidden]，其中 q_dim = num_heads * head_dim
+- k_proj: [kv_dim, hidden]，kv_dim = num_kv_heads * head_dim
+- v_proj: [kv_dim, hidden]
+- q_norm: [head_dim]
+- k_norm: [head_dim]
+- o_proj: [hidden, q_dim]
 
-3. 向量参数
-- `input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`, `final_norm`
-- 按一维向量原样写入
+2. linear-attention 层（Qwen3.5 GatedDeltaNet）
+- in_proj_qkv: [conv_dim, hidden]
+  - conv_dim = 2*linear_key_dim + linear_value_dim
+  - linear_key_dim = linear_num_key_heads * linear_key_head_dim
+  - linear_value_dim = linear_num_value_heads * linear_value_head_dim
+- in_proj_z: [linear_value_dim, hidden]
+- in_proj_b: [linear_num_value_heads, hidden]
+- in_proj_a: [linear_num_value_heads, hidden]
+- conv1d.weight: [conv_dim, linear_conv_kernel_dim]
+- dt_bias: [linear_num_value_heads]
+- A_log: [linear_num_value_heads]
+- norm.weight: [linear_value_head_dim]
+- out_proj: [hidden, linear_value_dim]
 
-### 5.3 Qwen3-1.7B 关键维度
+3. MLP（两类层共用）
+- post_attention_layernorm: [hidden]
+- gate_proj: [intermediate, hidden]
+- up_proj: [intermediate, hidden]
+- down_proj: [hidden, intermediate]
 
-- hidden: 2048
-- inter: 6144
-- num_heads: 16
-- num_kv_heads: 8
-- head_dim: 128
-- q_dim = `num_heads * head_dim` = 2048
-- kv_dim = `num_kv_heads * head_dim` = 1024
+4. 模型尾部
+- final_norm: [hidden]
+- lm_head: [vocab, hidden]
 
-## 6. 推理主流程（单步 decode）
+## 4. 推理主流程（逐步维度变化）
 
-每生成 1 个 token，执行：
+以下描述单 batch、单 token 的 decode_next。
 
-1. `embedding(token)`
-2. 对每一层：
-- `input_layernorm`
-- `Q/K/V` 投影（cuBLAS）
-- `q_norm / k_norm`
-- RoPE
-- 写入 KV cache
-- attention（短序列 FlashAttention，长序列 PagedAttention）
-- `O` 投影 + 残差
-- `post_attention_layernorm`
-- `gate/up/down` + SwiGLU + 残差
-3. `final_norm`
-4. `lm_head`
-5. 采样得到 next token
+### Step 0: 输入 token -> embedding
 
-## 7. CUDA 手写内容
+- 输入：token_id（标量）
+- 输出：x，形状 [hidden]
 
-`src/kernels.cu` 当前手写实现：
-- `embedding_lookup_kernel`
-- `rmsnorm_kernel`
-- `head_rmsnorm_kernel`
-- `rope_inplace_kernel`
-- `flash_attention_kernel`（online softmax）
-- `paged_attention_kernel`（page table）
-- `swiglu_kernel`
+### Step 1: 层前归一化
 
-说明：
-- RoPE 已按 Qwen3 `rotate_half` 语义实现（前半维与后半维配对）
-- Flash/Paged Attention 使用在线归一化统计，避免 softmax 数值不稳定
+- 输入：x [hidden]
+- 参数：input_layernorm [hidden]
+- 输出：x_norm [hidden]
 
-## 8. 使用步骤
+### Step 2A: full-attention 分支（layer_type=0）
 
-### 8.1 转换权重
+1. Q/K/V 投影
+- q_cat = q_proj(x_norm): [2*q_dim]
+- k = k_proj(x_norm): [kv_dim]
+- v = v_proj(x_norm): [kv_dim]
 
-```bash
-cd /root/qwen3-cuda-minimal
+2. q/gate 拆分（按 head 交错）
+- 对每个 head，q_cat 的 head 子块为 [q_chunk, gate_chunk]
+- 拼接后得到：
+  - q: [q_dim]
+  - q_gate: [q_dim]
+
+3. q_norm / k_norm
+- q 按 head_dim 做 head RMSNorm，形状不变 [q_dim]
+- k 按 head_dim 做 head RMSNorm，形状不变 [kv_dim]
+
+4. RoPE
+- 对 q、k 就地旋转，形状不变
+
+5. KV cache 追加
+- KCache[layer, pos, :] <- k
+- VCache[layer, pos, :] <- v
+
+6. 注意力计算
+- 短序列走 flash_attention
+- 长序列走 paged_attention
+- 输出 context: [q_dim]
+
+7. 门控与输出投影
+- context <- context * sigmoid(q_gate)
+- attn_out = o_proj(context): [hidden]
+
+### Step 2B: linear-attention 分支（layer_type=1）
+
+1. 投影
+- mixed_qkv = in_proj_qkv(x_norm): [conv_dim]
+- z = in_proj_z(x_norm): [linear_value_dim]
+- b = in_proj_b(x_norm): [linear_num_value_heads]
+- a = in_proj_a(x_norm): [linear_num_value_heads]
+
+2. depthwise causal conv
+- 使用每层 conv_state: [conv_dim, kernel]
+- 更新窗口后输出 mixed: [conv_dim]
+- mixed = silu(conv1d(...))
+
+3. 切分并重排
+- query_raw: [linear_key_dim]
+- key_raw: [linear_key_dim]
+- value_raw: [linear_value_dim]
+
+4. q/k L2 归一化
+- 每个 key head 单独做 L2Norm
+
+5. key head 扩展到 value head
+- 当 linear_num_value_heads > linear_num_key_heads 时重复扩展
+- q_rep / k_rep: [linear_num_value_heads, linear_key_head_dim]
+
+6. 递推状态更新（每个 value head）
+- recurrent_state 形状：
+  - [linear_num_value_heads, linear_key_head_dim, linear_value_head_dim]
+- 参数变换：
+  - beta = sigmoid(b)
+  - g = exp(-exp(A_log) * softplus(a + dt_bias))
+- 状态更新：
+  - state = state * g
+  - delta = (v - kv_mem) * beta
+  - state = state + k * delta
+
+7. 读出与门控归一化
+- core_out = state 与 q 的乘积，形状 [linear_value_dim]
+- 按 value_head 做 RMSNorm
+- 乘 norm.weight 与 silu(z)
+- linear_out = out_proj(core_out): [hidden]
+
+### Step 3: 残差连接
+
+- x <- residual + mixer_out
+- 形状始终 [hidden]
+
+### Step 4: MLP
+
+1. post_attention_layernorm
+- x_norm2: [hidden]
+
+2. SwiGLU
+- gate = gate_proj(x_norm2): [intermediate]
+- up = up_proj(x_norm2): [intermediate]
+- hidden_ffn = swiglu(gate, up): [intermediate]
+
+3. 下投影
+- mlp_out = down_proj(hidden_ffn): [hidden]
+
+4. 残差
+- x <- x + mlp_out
+
+### Step 5: 输出 logits
+
+- x_norm_final = final_norm(x): [hidden]
+- logits = lm_head(x_norm_final): [vocab]
+
+### Step 6: 采样参数变化（generate）
+
+每步 i 的温度更新：
+- temp_i = max(0.05, temp_{i-1} * temp_decay)
+- 当 i >= greedy_after 时直接 argmax。
+
+采样中还会应用：
+- top_k / top_p / min_p
+- no_repeat_ngram
+- presence_penalty / frequency_penalty / repetition_penalty
+
+## 5. 编译与运行
+
+### 5.1 转换
+
 python3 scripts/convert_qwen3_to_qmini.py \
-  --model-dir /root/qwen3-cuda-minimal/ms_models/Qwen/Qwen3-1.7B \
-  --output /root/qwen3-cuda-minimal/weights/qwen3_1.7b_seq512_refactor.qmini \
+  --model-dir /root/QweninCuda/ms_models/Qwen/Qwen3___5-4B \
+  --output /root/QweninCuda/weights/qwen3_5_4b_strict_seq512.qmini \
   --max-seq-len 512
-```
 
-### 8.2 编译
+### 5.2 编译
 
-```bash
-cd /root/qwen3-cuda-minimal
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-```
 
-### 8.3 推理
+### 5.3 运行
 
-```bash
-cd /root/qwen3-cuda-minimal
 python3 scripts/run_chat.py \
   --engine ./build/qwen_minimal \
-  --weights /root/qwen3-cuda-minimal/weights/qwen3_1.7b_seq512_refactor.qmini \
-  --model-dir /root/qwen3-cuda-minimal/ms_models/Qwen/Qwen3-1.7B \
+  --weights /root/QweninCuda/weights/qwen3_5_4b_strict_seq512.qmini \
+  --model-dir /root/QweninCuda/ms_models/Qwen/Qwen3___5-4B \
   --prompt "你好，请用一句话介绍你自己。" \
   --max-new-tokens 32 \
   --temperature 0.55 \
@@ -167,50 +240,41 @@ python3 scripts/run_chat.py \
   --top-p 0.78 \
   --min-p 0.12 \
   --temp-decay 0.94 \
-  --greedy-after 8 \
-  --no-repeat-ngram-size 3 \
-  --presence-penalty 0.2 \
-  --frequency-penalty 0.15 \
-  --repetition-penalty 1.3
-```
+  --greedy-after 8
 
-## 9. 对齐与验证
+## 6. 对齐与质量验证
 
-### 9.1 HF logits 对齐
+### 6.1 与 HF 逐步对齐
 
-```bash
-cd /root/qwen3-cuda-minimal
 python3 scripts/check_logits_alignment.py \
   --engine ./build/qwen_minimal \
-  --weights /root/qwen3-cuda-minimal/weights/qwen3_1.7b_seq512_refactor.qmini \
-  --model-dir /root/qwen3-cuda-minimal/ms_models/Qwen/Qwen3-1.7B \
+  --weights /root/QweninCuda/weights/qwen3_5_4b_strict_seq512.qmini \
+  --model-dir /root/QweninCuda/ms_models/Qwen/Qwen3___5-4B \
   --prompt "你好，请用一句话介绍你自己。" \
   --steps 8 \
-  --top-k 10 \
-  --save-json /root/qwen3-cuda-minimal/weights/alignment_report_1.7b.json
-```
+  --top-k 10
 
-### 9.2 五问冒烟测试
+### 6.2 冒烟测试
 
-```bash
-cd /root/qwen3-cuda-minimal
 python3 scripts/qa5_smoke_test.py \
   --engine ./build/qwen_minimal \
-  --weights /root/qwen3-cuda-minimal/weights/qwen3_1.7b_seq512_refactor.qmini \
-  --model-dir /root/qwen3-cuda-minimal/ms_models/Qwen/Qwen3-1.7B \
-  --output-report /root/qwen3-cuda-minimal/weights/qa5_report.md
-```
+  --weights /root/QweninCuda/weights/qwen3_5_4b_strict_seq512.qmini \
+  --model-dir /root/QweninCuda/ms_models/Qwen/Qwen3___5-4B \
+  --output-report /root/QweninCuda/weights/qa5_report_qwen3_5_4b.md
 
-## 10. 常见问题
+## 7. 常见问题
 
-1. `Repo id must be in the form ...`
-- 原因：传入路径不存在，被当成远程仓库名
-- 处理：使用存在的本地绝对路径
+1. Repo id must be in the form ...
+- 原因：model-dir 不存在，被误当成远程仓库名。
+- 处理：改成实际存在的本地绝对路径。
 
-2. 输出异常重复
-- 先检查权重文件是否为最新转换版本
-- 再调采样参数（temperature/top-k/top-p/min-p/penalty）
+2. 输出质量异常
+- 建议先跑逐步对齐脚本。
+- 若 step0 分叉，优先检查：
+  - q_proj 拆分顺序
+  - RMSNorm 权重语义
+  - RoPE 配对与头维度
 
-3. 对齐脚本 step0 就分叉
-- 通常是算子语义偏差（RoPE、attention 或权重布局）
-- 优先检查 RoPE 配对与转换脚本中的矩阵转置规则
+3. 速度偏慢
+- 当前 linear-attention 递推为 C++ 标量实现，优先保证结构正确。
+- 后续可将 linear 递推与 conv 更新 CUDA 化。
