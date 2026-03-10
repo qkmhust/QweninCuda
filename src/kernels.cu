@@ -7,6 +7,14 @@
 
 namespace {
 
+inline int choose_attention_threads(int head_dim) {
+  int threads = 1;
+  while (threads < head_dim && threads < 256) {
+    threads <<= 1;
+  }
+  return threads;
+}
+
 __global__ void embedding_lookup_kernel(const half* table, int vocab_size, int hidden_size, int token_id,
                                         half* out) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -320,10 +328,7 @@ void launch_swiglu(const half* gate, const half* up, int n, half* out) {
 
 void launch_flash_attention(const half* q, const half* k_cache, const half* v_cache, int num_heads,
                             int num_kv_heads, int head_dim, int seq_len, half* context) {
-  int threads = 1;
-  while (threads < head_dim && threads < 256) {
-    threads <<= 1;
-  }
+  int threads = choose_attention_threads(head_dim);
   flash_attention_kernel<<<num_heads, threads, threads * static_cast<int>(sizeof(float))>>>(
     q, k_cache, v_cache, num_heads, num_kv_heads, head_dim, seq_len, context);
 }
@@ -331,10 +336,7 @@ void launch_flash_attention(const half* q, const half* k_cache, const half* v_ca
 void launch_paged_attention(const half* q, const half* k_cache, const half* v_cache,
                             const int* page_table, int page_size, int num_heads, int num_kv_heads,
                             int head_dim, int seq_len, half* context) {
-  int threads = 1;
-  while (threads < head_dim && threads < 256) {
-    threads <<= 1;
-  }
+  int threads = choose_attention_threads(head_dim);
   paged_attention_kernel<<<num_heads, threads, threads * static_cast<int>(sizeof(float))>>>(
     q, k_cache, v_cache, page_table, page_size, num_heads, num_kv_heads, head_dim, seq_len, context);
 }

@@ -22,6 +22,10 @@ namespace {
 
 constexpr char kMagic[] = "QWENMINI";
 
+inline std::size_t kv_cache_offset(int position, int kv_dim) {
+  return static_cast<std::size_t>(position) * static_cast<std::size_t>(kv_dim);
+}
+
 void read_exact(std::ifstream& in, char* ptr, std::streamsize n) {
   in.read(ptr, n);
   if (!in) {
@@ -504,9 +508,10 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
     launch_rope_inplace(k_, cfg_.num_kv_heads, head_dim, position, cfg_.rope_theta);
 
     // 2) 写入 KV cache，供后续自回归步复用
-    CUDA_CHECK(cudaMemcpy(cache.k + static_cast<std::size_t>(position) * kv_dim, k_, kv_dim * sizeof(half),
+    std::size_t kv_off = kv_cache_offset(position, kv_dim);
+    CUDA_CHECK(cudaMemcpy(cache.k + kv_off, k_, kv_dim * sizeof(half),
                           cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(cache.v + static_cast<std::size_t>(position) * kv_dim, v_, kv_dim * sizeof(half),
+    CUDA_CHECK(cudaMemcpy(cache.v + kv_off, v_, kv_dim * sizeof(half),
                           cudaMemcpyDeviceToDevice));
 
     // 3) 短序列走 FlashAttention，长序列走 PagedAttention
