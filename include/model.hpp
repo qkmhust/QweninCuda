@@ -90,6 +90,10 @@ class QwenMiniModel {
   void free_all();
   int decode_next(int token_id, int position, std::vector<half>* host_logits = nullptr);
   void gemv(const half* x, const half* w, int in_dim, int out_dim, half* out);
+  void run_full_attention_block(const LayerWeights& weights, LayerCache& cache, int position);
+  void run_linear_attention_block(const LayerWeights& weights, LayerCache& cache);
+  void run_ffn_block(const LayerWeights& weights);
+  int compute_logits(std::vector<half>* host_logits);
 
   QwenMiniConfig cfg_;
   bool loaded_ = false;

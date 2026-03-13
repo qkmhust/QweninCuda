@@ -21,6 +21,9 @@
 
 namespace {
 
+// 当前这份推理器专门服务于 qmini v4 格式的 Qwen3.5 4B。
+// 这个模型的层会在 full attention 和 linear attention 之间交替出现，
+// 因此两条计算路径都需要保留，但旧版 qmini(v1/v2/v3) 的兼容逻辑可以删掉。
 constexpr char kMagic[] = "QWENMINI";
 constexpr int32_t kLayerTypeFullAttention = 0;
 constexpr int32_t kLayerTypeLinearAttention = 1;
@@ -30,6 +33,7 @@ inline std::size_t kv_cache_offset(int position, int kv_dim) {
 }
 
 void read_exact(std::ifstream& in, char* ptr, std::streamsize n) {
+  // 统一封装二进制读取，避免每次都手写错误检查。
   in.read(ptr, n);
   if (!in) {
     throw std::runtime_error("Failed to read model file");
@@ -37,6 +41,7 @@ void read_exact(std::ifstream& in, char* ptr, std::streamsize n) {
 }
 
 half* read_tensor_to_device(std::ifstream& in, std::size_t expected_elems, const char* name) {
+  // qmini 中每个张量前面都先写了元素个数，这里先读长度再读 payload。
   uint64_t n = 0;
   read_exact(in, reinterpret_cast<char*>(&n), sizeof(n));
   if (expected_elems != 0 && n != expected_elems) {
@@ -52,6 +57,42 @@ half* read_tensor_to_device(std::ifstream& in, std::size_t expected_elems, const
   CUDA_CHECK(cudaMalloc(&dev, n * sizeof(half)));
   CUDA_CHECK(cudaMemcpy(dev, host.data(), n * sizeof(half), cudaMemcpyHostToDevice));
   return dev;
+}
+
+void validate_qwen35_config(const QwenMiniConfig& cfg) {
+  if (cfg.head_dim <= 0) {
+    throw std::runtime_error("head_dim must be > 0");
+  }
+  if (cfg.linear_num_key_heads <= 0 || cfg.linear_num_value_heads <= 0 ||
+      cfg.linear_key_head_dim <= 0 || cfg.linear_value_head_dim <= 0 ||
+      cfg.linear_conv_kernel_dim <= 0) {
+    throw std::runtime_error("invalid qwen3.5 linear-attention dimensions");
+  }
+  if (static_cast<int>(cfg.layer_types.size()) != cfg.num_layers) {
+    throw std::runtime_error("layer_types size mismatch");
+  }
+  for (int32_t t : cfg.layer_types) {
+    if (t != kLayerTypeFullAttention && t != kLayerTypeLinearAttention) {
+      throw std::runtime_error("unknown layer type in qmini v4");
+    }
+  }
+}
+
+void split_q_and_gate(const std::vector<half>& packed_q_gate, int num_heads, int head_dim,
+                      std::vector<half>* q, std::vector<half>* gate) {
+  // Qwen3.5 的 full-attention q_proj 输出是 [q, gate] 按 head 交错存放：
+  // [head0_q, head0_gate, head1_q, head1_gate, ...]
+  // 为了后续分别做 RoPE 和 gate，需要拆成两段连续缓冲区。
+  q->resize(num_heads * head_dim);
+  gate->resize(num_heads * head_dim);
+  for (int h = 0; h < num_heads; ++h) {
+    int src = h * (2 * head_dim);
+    int dst = h * head_dim;
+    for (int d = 0; d < head_dim; ++d) {
+      (*q)[dst + d] = packed_q_gate[src + d];
+      (*gate)[dst + d] = packed_q_gate[src + head_dim + d];
+    }
+  }
 }
 
 int argmax_host(const std::vector<half>& logits) {
@@ -293,6 +334,10 @@ QwenMiniModel::QwenMiniModel() {}
 QwenMiniModel::~QwenMiniModel() { free_all(); }
 
 bool QwenMiniModel::load(const std::string& path) {
+  // load 的目标很简单：
+  // 1. 解析 qmini v4 头部
+  // 2. 把每层权重读到 GPU
+  // 3. 分配 decode 时反复复用的运行时缓存
   free_all();
 
   std::ifstream in(path, std::ios::binary);
@@ -310,14 +355,14 @@ bool QwenMiniModel::load(const std::string& path) {
 
   int32_t version = 0;
   read_exact(in, reinterpret_cast<char*>(&version), sizeof(version));
-  if (version != 1 && version != 2 && version != 3 && version != 4) {
-    std::cerr << "Unsupported model version: " << version << "\n";
+  if (version != 4) {
+    std::cerr << "This runtime only supports qmini v4 for Qwen3.5-4B, got version: "
+              << version << "\n";
     return false;
   }
   cfg_.version = version;
 
-  // qmini 头部采用固定顺序：先公共主干配置，再按版本追加扩展字段。
-  // v1/v2/v3 只含 full-attention 所需参数；v4 追加 qwen3.5 linear-attention 参数。 
+  // qmini v4 头部按固定顺序写入，直接顺序读取即可。
 
   read_exact(in, reinterpret_cast<char*>(&cfg_.vocab_size), sizeof(cfg_.vocab_size));
   read_exact(in, reinterpret_cast<char*>(&cfg_.hidden_size), sizeof(cfg_.hidden_size));
@@ -325,36 +370,22 @@ bool QwenMiniModel::load(const std::string& path) {
   read_exact(in, reinterpret_cast<char*>(&cfg_.num_layers), sizeof(cfg_.num_layers));
   read_exact(in, reinterpret_cast<char*>(&cfg_.num_heads), sizeof(cfg_.num_heads));
   read_exact(in, reinterpret_cast<char*>(&cfg_.num_kv_heads), sizeof(cfg_.num_kv_heads));
-  if (version >= 2) {
-    read_exact(in, reinterpret_cast<char*>(&cfg_.head_dim), sizeof(cfg_.head_dim));
-  } else {
-    cfg_.head_dim = cfg_.hidden_size / cfg_.num_heads;
-  }
-
-  if (version >= 4) {
-    read_exact(in, reinterpret_cast<char*>(&cfg_.linear_num_key_heads), sizeof(cfg_.linear_num_key_heads));
-    read_exact(in, reinterpret_cast<char*>(&cfg_.linear_num_value_heads), sizeof(cfg_.linear_num_value_heads));
-    read_exact(in, reinterpret_cast<char*>(&cfg_.linear_key_head_dim), sizeof(cfg_.linear_key_head_dim));
-    read_exact(in, reinterpret_cast<char*>(&cfg_.linear_value_head_dim), sizeof(cfg_.linear_value_head_dim));
-    read_exact(in, reinterpret_cast<char*>(&cfg_.linear_conv_kernel_dim), sizeof(cfg_.linear_conv_kernel_dim));
-  }
+  read_exact(in, reinterpret_cast<char*>(&cfg_.head_dim), sizeof(cfg_.head_dim));
+  read_exact(in, reinterpret_cast<char*>(&cfg_.linear_num_key_heads), sizeof(cfg_.linear_num_key_heads));
+  read_exact(in, reinterpret_cast<char*>(&cfg_.linear_num_value_heads), sizeof(cfg_.linear_num_value_heads));
+  read_exact(in, reinterpret_cast<char*>(&cfg_.linear_key_head_dim), sizeof(cfg_.linear_key_head_dim));
+  read_exact(in, reinterpret_cast<char*>(&cfg_.linear_value_head_dim), sizeof(cfg_.linear_value_head_dim));
+  read_exact(in, reinterpret_cast<char*>(&cfg_.linear_conv_kernel_dim), sizeof(cfg_.linear_conv_kernel_dim));
 
   read_exact(in, reinterpret_cast<char*>(&cfg_.max_seq_len), sizeof(cfg_.max_seq_len));
   read_exact(in, reinterpret_cast<char*>(&cfg_.rms_norm_eps), sizeof(cfg_.rms_norm_eps));
   read_exact(in, reinterpret_cast<char*>(&cfg_.rope_theta), sizeof(cfg_.rope_theta));
 
-  if (cfg_.head_dim <= 0) {
-    throw std::runtime_error("head_dim must be > 0");
-  }
-
-  if (version >= 4) {
-    // v4 显式保存每一层类型：0=full_attention, 1=linear_attention。
-    cfg_.layer_types.resize(cfg_.num_layers);
-    read_exact(in, reinterpret_cast<char*>(cfg_.layer_types.data()),
-               static_cast<std::streamsize>(cfg_.num_layers * sizeof(int32_t)));
-  } else {
-    cfg_.layer_types.assign(cfg_.num_layers, kLayerTypeFullAttention);
-  }
+  // Qwen3.5 4B 显式记录每一层究竟是 full attention 还是 linear attention。
+  cfg_.layer_types.resize(cfg_.num_layers);
+  read_exact(in, reinterpret_cast<char*>(cfg_.layer_types.data()),
+             static_cast<std::streamsize>(cfg_.num_layers * sizeof(int32_t)));
+  validate_qwen35_config(cfg_);
 
   const std::size_t hidden = static_cast<std::size_t>(cfg_.hidden_size);
   const std::size_t inter = static_cast<std::size_t>(cfg_.intermediate_size);
@@ -376,7 +407,7 @@ bool QwenMiniModel::load(const std::string& path) {
     l.attn_norm = read_tensor_to_device(in, hidden, "layer.attn_norm");
 
     if (l.is_linear) {
-      // linear-attention 层：完整加载 GatedDeltaNet 权重。
+      // linear-attention 层使用 GatedDeltaNet 递推结构，需要整组专用权重。
       l.linear_in_qkv = read_tensor_to_device(in, hidden * linear_conv_dim, "layer.linear_in_qkv");
       l.linear_in_z = read_tensor_to_device(in, hidden * linear_val_dim, "layer.linear_in_z");
       l.linear_in_b = read_tensor_to_device(in, hidden * cfg_.linear_num_value_heads, "layer.linear_in_b");
@@ -388,18 +419,14 @@ bool QwenMiniModel::load(const std::string& path) {
       l.linear_norm_w = read_tensor_to_device(in, cfg_.linear_value_head_dim, "layer.linear_norm_w");
       l.linear_out_proj = read_tensor_to_device(in, linear_val_dim * hidden, "layer.linear_out_proj");
     } else {
-      // full-attention 层：v4 的 q_proj 维度为 2*q_dim（query + gate）。
-      std::size_t q_proj_dim = q_dim;
-      if (version >= 4) {
-        q_proj_dim = q_dim * 2;
-      }
+      // full-attention 层的 q_proj 输出大小固定为 2*q_dim：
+      // 前半段是 query，后半段是输出门控 gate。
+      std::size_t q_proj_dim = q_dim * 2;
       l.wq = read_tensor_to_device(in, hidden * q_proj_dim, "layer.wq");
       l.wk = read_tensor_to_device(in, hidden * kv_dim, "layer.wk");
       l.wv = read_tensor_to_device(in, hidden * kv_dim, "layer.wv");
-      if (version >= 3) {
-        l.q_norm = read_tensor_to_device(in, cfg_.head_dim, "layer.q_norm");
-        l.k_norm = read_tensor_to_device(in, cfg_.head_dim, "layer.k_norm");
-      }
+      l.q_norm = read_tensor_to_device(in, cfg_.head_dim, "layer.q_norm");
+      l.k_norm = read_tensor_to_device(in, cfg_.head_dim, "layer.k_norm");
       l.wo = read_tensor_to_device(in, q_dim * hidden, "layer.wo");
     }
 
@@ -418,6 +445,8 @@ bool QwenMiniModel::load(const std::string& path) {
 }
 
 bool QwenMiniModel::alloc_runtime() {
+  // 这里只做一次性分配。
+  // decode 阶段每生成 1 个 token 都会反复复用这些缓冲区，避免频繁申请/释放显存。
   const std::size_t hidden = static_cast<std::size_t>(cfg_.hidden_size);
   const std::size_t inter = static_cast<std::size_t>(cfg_.intermediate_size);
   const std::size_t vocab = static_cast<std::size_t>(cfg_.vocab_size);
@@ -432,8 +461,9 @@ bool QwenMiniModel::alloc_runtime() {
 
   CUBLAS_CHECK(cublasCreate(&cublas_));
 
-  // 主干中间激活缓存（单 token decode）：
-  // x/x_norm/x_resid 分别表示层输入、归一化后、残差分支缓存。
+  // x_: 当前层输入
+  // x_norm_: 做过 RMSNorm 的输入
+  // x_resid_: 残差分支暂存
 
   CUDA_CHECK(cudaMalloc(&x_, hidden * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&x_norm_, hidden * sizeof(half)));
@@ -445,9 +475,9 @@ bool QwenMiniModel::alloc_runtime() {
   CUDA_CHECK(cudaMalloc(&context_, q_dim * sizeof(half)));
 
   std::size_t mixed_size = std::max<std::size_t>(linear_conv_dim, q_dim * 2);
-  // linear_mixed_qkv_ 在两条路径复用：
-  // 1) full-attention v4 临时承接 q_proj(2*q_dim)
-  // 2) linear-attention 承接 in_proj_qkv(conv_dim)
+  // linear_mixed_qkv_ 是一个“通用临时缓冲区”：
+  // 1. 在 full-attention 层里暂存 packed q/gate
+  // 2. 在 linear-attention 层里暂存 conv 前的 qkv 投影结果
   CUDA_CHECK(cudaMalloc(&linear_mixed_qkv_, std::max<std::size_t>(1, mixed_size) * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&linear_z_, std::max<std::size_t>(1, linear_val_dim) * sizeof(half)));
   CUDA_CHECK(cudaMalloc(&linear_b_, std::max(1, cfg_.linear_num_value_heads) * sizeof(half)));
@@ -462,13 +492,13 @@ bool QwenMiniModel::alloc_runtime() {
   caches_.resize(cfg_.num_layers);
   for (int i = 0; i < cfg_.num_layers; ++i) {
     if (cfg_.layer_types[i] == kLayerTypeFullAttention) {
-      // full-attention：按 [seq, kv_dim] 线性存储 K/V cache。
+      // full-attention 需要保存整段历史 K/V，供后续 token 回看。
       CUDA_CHECK(cudaMalloc(&caches_[i].k, cfg_.max_seq_len * kv_dim * sizeof(half)));
       CUDA_CHECK(cudaMalloc(&caches_[i].v, cfg_.max_seq_len * kv_dim * sizeof(half)));
     } else {
-      // linear-attention：
-      // conv_state 形状 = [conv_dim, kernel_size]
-      // recurrent_state 形状 = [num_v_heads, key_dim_per_head, value_dim_per_head]
+      // linear-attention 不保存完整 K/V，而是保存两块递推状态：
+      // 1. depthwise causal conv 的滑动窗口状态
+      // 2. GatedDeltaNet 的 recurrent state
       int conv_dim_i = cfg_.linear_num_key_heads * cfg_.linear_key_head_dim * 2 +
                        cfg_.linear_num_value_heads * cfg_.linear_value_head_dim;
       caches_[i].linear_conv_state.assign(conv_dim_i * cfg_.linear_conv_kernel_dim, 0.0f);
@@ -588,6 +618,8 @@ void QwenMiniModel::free_all() {
 }
 
 void QwenMiniModel::gemv(const half* x, const half* w, int in_dim, int out_dim, half* out) {
+  // 所有线性层都统一视作 matrix-vector 乘法。
+  // 权重在 qmini 中按列主序布局存储，因此这里直接调用 cublasGemmEx。
   static const float alpha = 1.0f;
   static const float beta = 0.0f;
   CUBLAS_CHECK(cublasGemmEx(cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -601,13 +633,53 @@ void QwenMiniModel::gemv(const half* x, const half* w, int in_dim, int out_dim, 
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
-int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* host_logits) {
-  const int hidden = cfg_.hidden_size;
-  const int inter = cfg_.intermediate_size;
+void QwenMiniModel::run_full_attention_block(const LayerWeights& weights, LayerCache& cache, int position) {
+  // 这一小段只负责 full-attention 层本身：
+  // 输入 x_norm_，输出新的 x_。
   const int head_dim = cfg_.head_dim;
   const int q_dim = cfg_.num_heads * head_dim;
   const int kv_dim = cfg_.num_kv_heads * head_dim;
+  const int q_proj_dim = q_dim * 2;
 
+  gemv(x_norm_, weights.wq, cfg_.hidden_size, q_proj_dim, linear_mixed_qkv_);
+
+  std::vector<half> packed_q_gate(q_proj_dim);
+  std::vector<half> q_host;
+  std::vector<half> gate_host;
+  CUDA_CHECK(cudaMemcpy(packed_q_gate.data(), linear_mixed_qkv_, q_proj_dim * sizeof(half), cudaMemcpyDeviceToHost));
+  split_q_and_gate(packed_q_gate, cfg_.num_heads, head_dim, &q_host, &gate_host);
+  CUDA_CHECK(cudaMemcpy(q_, q_host.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(q_gate_, gate_host.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
+
+  gemv(x_norm_, weights.wk, cfg_.hidden_size, kv_dim, k_);
+  gemv(x_norm_, weights.wv, cfg_.hidden_size, kv_dim, v_);
+
+  launch_head_rmsnorm(q_, weights.q_norm, cfg_.num_heads, head_dim, cfg_.rms_norm_eps, q_);
+  launch_head_rmsnorm(k_, weights.k_norm, cfg_.num_kv_heads, head_dim, cfg_.rms_norm_eps, k_);
+
+  launch_rope_inplace(q_, cfg_.num_heads, head_dim, position, cfg_.rope_theta);
+  launch_rope_inplace(k_, cfg_.num_kv_heads, head_dim, position, cfg_.rope_theta);
+
+  std::size_t kv_off = kv_cache_offset(position, kv_dim);
+  CUDA_CHECK(cudaMemcpy(cache.k + kv_off, k_, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(cudaMemcpy(cache.v + kv_off, v_, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice));
+
+  int seq_len = position + 1;
+  if (seq_len <= page_size_ * 8) {
+    launch_flash_attention(q_, cache.k, cache.v, cfg_.num_heads, cfg_.num_kv_heads, head_dim, seq_len,
+                           context_);
+  } else {
+    launch_paged_attention(q_, cache.k, cache.v, page_table_dev_, page_size_, cfg_.num_heads,
+                           cfg_.num_kv_heads, head_dim, seq_len, context_);
+  }
+
+  launch_sigmoid_mul_inplace(context_, q_gate_, q_dim);
+  gemv(context_, weights.wo, q_dim, cfg_.hidden_size, x_);
+}
+
+void QwenMiniModel::run_linear_attention_block(const LayerWeights& weights, LayerCache& cache) {
+  // 这一小段只负责 linear-attention 层本身：
+  // 输入 x_norm_，输出新的 x_。
   const int linear_kh = cfg_.linear_num_key_heads;
   const int linear_vh = cfg_.linear_num_value_heads;
   const int linear_kd = cfg_.linear_key_head_dim;
@@ -616,229 +688,153 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
   const int linear_val_dim = linear_vh * linear_vd;
   const int linear_conv_dim = linear_key_dim * 2 + linear_val_dim;
 
-  launch_embedding_lookup(tok_embeddings_, cfg_.vocab_size, hidden, token_id, x_);
+  gemv(x_norm_, weights.linear_in_qkv, cfg_.hidden_size, linear_conv_dim, linear_mixed_qkv_);
+  gemv(x_norm_, weights.linear_in_z, cfg_.hidden_size, linear_val_dim, linear_z_);
+  gemv(x_norm_, weights.linear_in_b, cfg_.hidden_size, linear_vh, linear_b_);
+  gemv(x_norm_, weights.linear_in_a, cfg_.hidden_size, linear_vh, linear_a_);
 
-  for (int i = 0; i < cfg_.num_layers; ++i) {
-    const auto& w = layers_[i];
-    auto& cache = caches_[i];
+  std::vector<half> h_qkv(linear_conv_dim);
+  std::vector<half> h_z(linear_val_dim);
+  std::vector<half> h_b(linear_vh);
+  std::vector<half> h_a(linear_vh);
+  std::vector<half> h_conv_w(linear_conv_dim * cfg_.linear_conv_kernel_dim);
+  std::vector<half> h_dt_bias(linear_vh);
+  std::vector<half> h_a_log(linear_vh);
+  std::vector<half> h_norm_w(linear_vd);
 
-    CUDA_CHECK(cudaMemcpy(x_resid_, x_, hidden * sizeof(half), cudaMemcpyDeviceToDevice));
-    launch_rmsnorm(x_, w.attn_norm, hidden, cfg_.rms_norm_eps, x_norm_);
+  CUDA_CHECK(cudaMemcpy(h_qkv.data(), linear_mixed_qkv_, linear_conv_dim * sizeof(half), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_z.data(), linear_z_, linear_val_dim * sizeof(half), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_b.data(), linear_b_, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_a.data(), linear_a_, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_conv_w.data(), weights.linear_conv1d_w,
+                        linear_conv_dim * cfg_.linear_conv_kernel_dim * sizeof(half),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_dt_bias.data(), weights.linear_dt_bias, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_a_log.data(), weights.linear_a_log, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_norm_w.data(), weights.linear_norm_w, linear_vd * sizeof(half), cudaMemcpyDeviceToHost));
 
-    if (!w.is_linear) {
-      // ---------------- full-attention 路径 ----------------
-      // q_proj: [hidden] -> [2*q_dim]，按每个 head 的 [q_chunk, gate_chunk] 交错排列。
-      int q_proj_dim = (cfg_.version >= 4) ? (q_dim * 2) : q_dim;
-      if (cfg_.version >= 4) {
-        gemv(x_norm_, w.wq, hidden, q_proj_dim, linear_mixed_qkv_);
-        std::vector<half> qcat(q_proj_dim);
-        std::vector<half> qv(q_dim);
-        std::vector<half> gv(q_dim);
-        CUDA_CHECK(cudaMemcpy(qcat.data(), linear_mixed_qkv_, q_proj_dim * sizeof(half), cudaMemcpyDeviceToHost));
-        for (int h = 0; h < cfg_.num_heads; ++h) {
-          int src = h * (2 * head_dim);
-          int dst = h * head_dim;
-          // 逐 head 反交错拆分，严格对齐官方实现。
-          for (int d = 0; d < head_dim; ++d) {
-            qv[dst + d] = qcat[src + d];
-            gv[dst + d] = qcat[src + head_dim + d];
-          }
-        }
-        CUDA_CHECK(cudaMemcpy(q_, qv.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(q_gate_, gv.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
-      } else {
-        gemv(x_norm_, w.wq, hidden, q_dim, q_);
-      }
-      gemv(x_norm_, w.wk, hidden, kv_dim, k_);
-      gemv(x_norm_, w.wv, hidden, kv_dim, v_);
-
-      if (w.q_norm) {
-        launch_head_rmsnorm(q_, w.q_norm, cfg_.num_heads, head_dim, cfg_.rms_norm_eps, q_);
-      }
-      if (w.k_norm) {
-        launch_head_rmsnorm(k_, w.k_norm, cfg_.num_kv_heads, head_dim, cfg_.rms_norm_eps, k_);
-      }
-
-      launch_rope_inplace(q_, cfg_.num_heads, head_dim, position, cfg_.rope_theta);
-      launch_rope_inplace(k_, cfg_.num_kv_heads, head_dim, position, cfg_.rope_theta);
-
-      // KV cache 追加当前位置向量。
-      std::size_t kv_off = kv_cache_offset(position, kv_dim);
-      CUDA_CHECK(cudaMemcpy(cache.k + kv_off, k_, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice));
-      CUDA_CHECK(cudaMemcpy(cache.v + kv_off, v_, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice));
-
-      int seq_len = position + 1;
-      if (seq_len <= page_size_ * 8) {
-        launch_flash_attention(q_, cache.k, cache.v, cfg_.num_heads, cfg_.num_kv_heads, head_dim, seq_len,
-                               context_);
-      } else {
-        launch_paged_attention(q_, cache.k, cache.v, page_table_dev_, page_size_, cfg_.num_heads,
-                               cfg_.num_kv_heads, head_dim, seq_len, context_);
-      }
-
-      if (cfg_.version >= 4) {
-        // 官方 qwen3.5：attention 输出先乘 sigmoid(gate)，再 o_proj。
-        launch_sigmoid_mul_inplace(context_, q_gate_, q_dim);
-      }
-      gemv(context_, w.wo, q_dim, hidden, x_);
-    } else {
-      // ---------------- linear-attention 路径 ----------------
-      // 对齐 Qwen3.5 GatedDeltaNet 的 decode 递推实现。
-      gemv(x_norm_, w.linear_in_qkv, hidden, linear_conv_dim, linear_mixed_qkv_);
-      gemv(x_norm_, w.linear_in_z, hidden, linear_val_dim, linear_z_);
-      gemv(x_norm_, w.linear_in_b, hidden, linear_vh, linear_b_);
-      gemv(x_norm_, w.linear_in_a, hidden, linear_vh, linear_a_);
-
-      std::vector<half> h_qkv(linear_conv_dim);
-      std::vector<half> h_z(linear_val_dim);
-      std::vector<half> h_b(linear_vh);
-      std::vector<half> h_a(linear_vh);
-      std::vector<half> h_conv_w(linear_conv_dim * cfg_.linear_conv_kernel_dim);
-      std::vector<half> h_dt_bias(linear_vh);
-      std::vector<half> h_a_log(linear_vh);
-      std::vector<half> h_norm_w(linear_vd);
-
-      CUDA_CHECK(cudaMemcpy(h_qkv.data(), linear_mixed_qkv_, linear_conv_dim * sizeof(half), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_z.data(), linear_z_, linear_val_dim * sizeof(half), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_b.data(), linear_b_, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_a.data(), linear_a_, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_conv_w.data(), w.linear_conv1d_w,
-                            linear_conv_dim * cfg_.linear_conv_kernel_dim * sizeof(half),
-                            cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_dt_bias.data(), w.linear_dt_bias, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_a_log.data(), w.linear_a_log, linear_vh * sizeof(half), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_norm_w.data(), w.linear_norm_w, linear_vd * sizeof(half), cudaMemcpyDeviceToHost));
-
-      std::vector<float> mixed(linear_conv_dim, 0.0f);
-      for (int c = 0; c < linear_conv_dim; ++c) {
-        // depthwise causal conv 状态左移一位，写入当前 token 投影值。
-        for (int t = 0; t < cfg_.linear_conv_kernel_dim - 1; ++t) {
-          cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + t] =
-            cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + t + 1];
-        }
-        cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + (cfg_.linear_conv_kernel_dim - 1)] =
-          __half2float(h_qkv[c]);
-
-        float acc = 0.0f;
-        for (int t = 0; t < cfg_.linear_conv_kernel_dim; ++t) {
-          float wv = __half2float(h_conv_w[c * cfg_.linear_conv_kernel_dim + t]);
-          float sv = cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + t];
-          acc += wv * sv;
-        }
-        mixed[c] = silu(acc);
-      }
-
-      std::vector<float> q(linear_key_dim);
-      std::vector<float> k(linear_key_dim);
-      std::vector<float> v(linear_val_dim);
-      for (int j = 0; j < linear_key_dim; ++j) {
-        q[j] = mixed[j];
-        k[j] = mixed[linear_key_dim + j];
-      }
-      for (int j = 0; j < linear_val_dim; ++j) {
-        v[j] = mixed[2 * linear_key_dim + j];
-      }
-
-      for (int h = 0; h < linear_kh; ++h) {
-        // 与官方 fallback 一致：q/k 在 head 维做 L2Norm。
-        l2norm_inplace(q, h * linear_kd, linear_kd);
-        l2norm_inplace(k, h * linear_kd, linear_kd);
-      }
-
-      int repeat = linear_vh / linear_kh;
-      std::vector<float> q_rep(linear_vh * linear_kd);
-      std::vector<float> k_rep(linear_vh * linear_kd);
-      for (int h = 0; h < linear_vh; ++h) {
-        int src_h = h / repeat;
-        for (int d = 0; d < linear_kd; ++d) {
-          q_rep[h * linear_kd + d] = q[src_h * linear_kd + d] * (1.0f / std::sqrt(static_cast<float>(linear_kd)));
-          k_rep[h * linear_kd + d] = k[src_h * linear_kd + d];
-        }
-      }
-
-      std::vector<float> out(linear_val_dim, 0.0f);
-      for (int h = 0; h < linear_vh; ++h) {
-        // 递推门控参数：
-        // beta = sigmoid(b)
-        // g = exp(-exp(A_log) * softplus(a + dt_bias))
-        float beta = 1.0f / (1.0f + std::exp(-__half2float(h_b[h])));
-        float a = __half2float(h_a[h]) + __half2float(h_dt_bias[h]);
-        float softp = std::log1pf(std::exp(a));
-        float g = std::exp(-std::exp(__half2float(h_a_log[h])) * softp);
-
-        float* state = cache.linear_recurrent_state.data() + h * linear_kd * linear_vd;
-
-        for (int kd = 0; kd < linear_kd; ++kd) {
-          for (int vd = 0; vd < linear_vd; ++vd) {
-            // recurrent state 衰减。
-            state[kd * linear_vd + vd] *= g;
-          }
-        }
-
-        std::vector<float> kv_mem(linear_vd, 0.0f);
-        for (int vd = 0; vd < linear_vd; ++vd) {
-          float m = 0.0f;
-          for (int kd = 0; kd < linear_kd; ++kd) {
-            m += state[kd * linear_vd + vd] * k_rep[h * linear_kd + kd];
-          }
-          kv_mem[vd] = m;
-        }
-
-        for (int vd = 0; vd < linear_vd; ++vd) {
-          // delta rule：state += k * ((v - kv_mem) * beta)
-          float delta = (v[h * linear_vd + vd] - kv_mem[vd]) * beta;
-          for (int kd = 0; kd < linear_kd; ++kd) {
-            state[kd * linear_vd + vd] += k_rep[h * linear_kd + kd] * delta;
-          }
-        }
-
-        for (int vd = 0; vd < linear_vd; ++vd) {
-          float y = 0.0f;
-          for (int kd = 0; kd < linear_kd; ++kd) {
-            y += state[kd * linear_vd + vd] * q_rep[h * linear_kd + kd];
-          }
-          out[h * linear_vd + vd] = y;
-        }
-      }
-
-      std::vector<half> out_h(linear_val_dim);
-      for (int h = 0; h < linear_vh; ++h) {
-        // RMSNormGated：先按 value head 归一化，再乘 norm_w 与 silu(z)。
-        float ss = 0.0f;
-        for (int vd = 0; vd < linear_vd; ++vd) {
-          float y = out[h * linear_vd + vd];
-          ss += y * y;
-        }
-        float inv = 1.0f / std::sqrt(ss / static_cast<float>(linear_vd) + cfg_.rms_norm_eps);
-        for (int vd = 0; vd < linear_vd; ++vd) {
-          float normed = out[h * linear_vd + vd] * inv;
-          float gate = silu(__half2float(h_z[h * linear_vd + vd]));
-          float ww = __half2float(h_norm_w[vd]);
-          out_h[h * linear_vd + vd] = __float2half(normed * ww * gate);
-        }
-      }
-
-      CUDA_CHECK(cudaMemcpy(linear_out_, out_h.data(), linear_val_dim * sizeof(half), cudaMemcpyHostToDevice));
-      gemv(linear_out_, w.linear_out_proj, linear_val_dim, hidden, x_);
+  std::vector<float> mixed(linear_conv_dim, 0.0f);
+  for (int c = 0; c < linear_conv_dim; ++c) {
+    for (int t = 0; t < cfg_.linear_conv_kernel_dim - 1; ++t) {
+      cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + t] =
+        cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + t + 1];
     }
+    cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + (cfg_.linear_conv_kernel_dim - 1)] =
+      __half2float(h_qkv[c]);
 
-    // attention/linear mixer 输出与残差相加。
-    launch_add_inplace(x_, x_resid_, hidden);
-
-    CUDA_CHECK(cudaMemcpy(x_resid_, x_, hidden * sizeof(half), cudaMemcpyDeviceToDevice));
-    launch_rmsnorm(x_, w.ffn_norm, hidden, cfg_.rms_norm_eps, x_norm_);
-
-    gemv(x_norm_, w.w_gate, hidden, inter, ffn_gate_);
-    gemv(x_norm_, w.w_up, hidden, inter, ffn_up_);
-    launch_swiglu(ffn_gate_, ffn_up_, inter, ffn_hidden_);
-    gemv(ffn_hidden_, w.w_down, inter, hidden, x_);
-    // MLP 残差。
-    launch_add_inplace(x_, x_resid_, hidden);
+    float acc = 0.0f;
+    for (int t = 0; t < cfg_.linear_conv_kernel_dim; ++t) {
+      float wv = __half2float(h_conv_w[c * cfg_.linear_conv_kernel_dim + t]);
+      float sv = cache.linear_conv_state[c * cfg_.linear_conv_kernel_dim + t];
+      acc += wv * sv;
+    }
+    mixed[c] = silu(acc);
   }
 
-  // 末层 norm + lm_head，得到当前位置 logits。
-  launch_rmsnorm(x_, final_norm_, hidden, cfg_.rms_norm_eps, x_norm_);
-  gemv(x_norm_, lm_head_, hidden, cfg_.vocab_size, logits_);
+  std::vector<float> q(linear_key_dim);
+  std::vector<float> k(linear_key_dim);
+  std::vector<float> v(linear_val_dim);
+  for (int j = 0; j < linear_key_dim; ++j) {
+    q[j] = mixed[j];
+    k[j] = mixed[linear_key_dim + j];
+  }
+  for (int j = 0; j < linear_val_dim; ++j) {
+    v[j] = mixed[2 * linear_key_dim + j];
+  }
+
+  for (int h = 0; h < linear_kh; ++h) {
+    l2norm_inplace(q, h * linear_kd, linear_kd);
+    l2norm_inplace(k, h * linear_kd, linear_kd);
+  }
+
+  int repeat = linear_vh / linear_kh;
+  std::vector<float> q_rep(linear_vh * linear_kd);
+  std::vector<float> k_rep(linear_vh * linear_kd);
+  for (int h = 0; h < linear_vh; ++h) {
+    int src_h = h / repeat;
+    for (int d = 0; d < linear_kd; ++d) {
+      q_rep[h * linear_kd + d] = q[src_h * linear_kd + d] * (1.0f / std::sqrt(static_cast<float>(linear_kd)));
+      k_rep[h * linear_kd + d] = k[src_h * linear_kd + d];
+    }
+  }
+
+  std::vector<float> out(linear_val_dim, 0.0f);
+  for (int h = 0; h < linear_vh; ++h) {
+    float beta = 1.0f / (1.0f + std::exp(-__half2float(h_b[h])));
+    float a = __half2float(h_a[h]) + __half2float(h_dt_bias[h]);
+    float softp = std::log1pf(std::exp(a));
+    float g = std::exp(-std::exp(__half2float(h_a_log[h])) * softp);
+
+    float* state = cache.linear_recurrent_state.data() + h * linear_kd * linear_vd;
+
+    for (int kd = 0; kd < linear_kd; ++kd) {
+      for (int vd = 0; vd < linear_vd; ++vd) {
+        state[kd * linear_vd + vd] *= g;
+      }
+    }
+
+    std::vector<float> kv_mem(linear_vd, 0.0f);
+    for (int vd = 0; vd < linear_vd; ++vd) {
+      float m = 0.0f;
+      for (int kd = 0; kd < linear_kd; ++kd) {
+        m += state[kd * linear_vd + vd] * k_rep[h * linear_kd + kd];
+      }
+      kv_mem[vd] = m;
+    }
+
+    for (int vd = 0; vd < linear_vd; ++vd) {
+      float delta = (v[h * linear_vd + vd] - kv_mem[vd]) * beta;
+      for (int kd = 0; kd < linear_kd; ++kd) {
+        state[kd * linear_vd + vd] += k_rep[h * linear_kd + kd] * delta;
+      }
+    }
+
+    for (int vd = 0; vd < linear_vd; ++vd) {
+      float y = 0.0f;
+      for (int kd = 0; kd < linear_kd; ++kd) {
+        y += state[kd * linear_vd + vd] * q_rep[h * linear_kd + kd];
+      }
+      out[h * linear_vd + vd] = y;
+    }
+  }
+
+  std::vector<half> out_h(linear_val_dim);
+  for (int h = 0; h < linear_vh; ++h) {
+    float ss = 0.0f;
+    for (int vd = 0; vd < linear_vd; ++vd) {
+      float y = out[h * linear_vd + vd];
+      ss += y * y;
+    }
+    float inv = 1.0f / std::sqrt(ss / static_cast<float>(linear_vd) + cfg_.rms_norm_eps);
+    for (int vd = 0; vd < linear_vd; ++vd) {
+      float normed = out[h * linear_vd + vd] * inv;
+      float gate = silu(__half2float(h_z[h * linear_vd + vd]));
+      float ww = __half2float(h_norm_w[vd]);
+      out_h[h * linear_vd + vd] = __float2half(normed * ww * gate);
+    }
+  }
+
+  CUDA_CHECK(cudaMemcpy(linear_out_, out_h.data(), linear_val_dim * sizeof(half), cudaMemcpyHostToDevice));
+  gemv(linear_out_, weights.linear_out_proj, linear_val_dim, cfg_.hidden_size, x_);
+}
+
+void QwenMiniModel::run_ffn_block(const LayerWeights& weights) {
+  // attention/linear mixer 结束后，所有层都进入统一的 FFN 流程。
+  CUDA_CHECK(cudaMemcpy(x_resid_, x_, cfg_.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+  launch_rmsnorm(x_, weights.ffn_norm, cfg_.hidden_size, cfg_.rms_norm_eps, x_norm_);
+
+  gemv(x_norm_, weights.w_gate, cfg_.hidden_size, cfg_.intermediate_size, ffn_gate_);
+  gemv(x_norm_, weights.w_up, cfg_.hidden_size, cfg_.intermediate_size, ffn_up_);
+  launch_swiglu(ffn_gate_, ffn_up_, cfg_.intermediate_size, ffn_hidden_);
+  gemv(ffn_hidden_, weights.w_down, cfg_.intermediate_size, cfg_.hidden_size, x_);
+  launch_add_inplace(x_, x_resid_, cfg_.hidden_size);
+}
+
+int QwenMiniModel::compute_logits(std::vector<half>* host_logits) {
+  // 末层 norm + lm_head 单独收成一个函数，方便把 decode_next 看成：
+  // “嵌入 -> N 层 block -> logits”。
+  launch_rmsnorm(x_, final_norm_, cfg_.hidden_size, cfg_.rms_norm_eps, x_norm_);
+  gemv(x_norm_, lm_head_, cfg_.hidden_size, cfg_.vocab_size, logits_);
 
   std::vector<half> local_logits;
   std::vector<half>& out = host_logits ? *host_logits : local_logits;
@@ -846,6 +842,30 @@ int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* ho
   CUDA_CHECK(cudaMemcpy(out.data(), logits_, cfg_.vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaDeviceSynchronize());
   return argmax_host(out);
+}
+
+int QwenMiniModel::decode_next(int token_id, int position, std::vector<half>* host_logits) {
+  // decode_next 现在只保留“主流程调度”这件事，阅读上更像一张执行清单。
+  launch_embedding_lookup(tok_embeddings_, cfg_.vocab_size, cfg_.hidden_size, token_id, x_);
+
+  for (int i = 0; i < cfg_.num_layers; ++i) {
+    const auto& weights = layers_[i];
+    auto& cache = caches_[i];
+
+    CUDA_CHECK(cudaMemcpy(x_resid_, x_, cfg_.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    launch_rmsnorm(x_, weights.attn_norm, cfg_.hidden_size, cfg_.rms_norm_eps, x_norm_);
+
+    if (weights.is_linear) {
+      run_linear_attention_block(weights, cache);
+    } else {
+      run_full_attention_block(weights, cache, position);
+    }
+
+    launch_add_inplace(x_, x_resid_, cfg_.hidden_size);
+    run_ffn_block(weights);
+  }
+
+  return compute_logits(host_logits);
 }
 
 std::vector<int> QwenMiniModel::generate(const std::vector<int>& input_ids, int max_new_tokens, int eos_id,
@@ -871,10 +891,14 @@ std::vector<int> QwenMiniModel::generate(const std::vector<int>& input_ids, int 
 
   auto t0 = std::chrono::high_resolution_clock::now();
 
+  // 预填充阶段：把 prompt 除最后一个 token 以外的内容全部送进模型，
+  // 主要目的是把 KV cache / recurrent state 预热到“看到完整上下文”的状态。
   for (int pos = 0; pos < static_cast<int>(input_ids.size()) - 1; ++pos) {
     (void)decode_next(input_ids[pos], pos);
   }
 
+  // 自回归阶段：每次拿上一步生成的 token，推一次 decode_next，
+  // 再按采样策略选出新的 token。
   int cur = input_ids.back();
   int pos = static_cast<int>(input_ids.size()) - 1;
   std::vector<half> step_logits;
