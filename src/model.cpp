@@ -78,23 +78,6 @@ void validate_qwen35_config(const QwenMiniConfig& cfg) {
   }
 }
 
-void split_q_and_gate(const std::vector<half>& packed_q_gate, int num_heads, int head_dim,
-                      std::vector<half>* q, std::vector<half>* gate) {
-  // Qwen3.5 的 full-attention q_proj 输出是 [q, gate] 按 head 交错存放：
-  // [head0_q, head0_gate, head1_q, head1_gate, ...]
-  // 为了后续分别做 RoPE 和 gate，需要拆成两段连续缓冲区。
-  q->resize(num_heads * head_dim);
-  gate->resize(num_heads * head_dim);
-  for (int h = 0; h < num_heads; ++h) {
-    int src = h * (2 * head_dim);
-    int dst = h * head_dim;
-    for (int d = 0; d < head_dim; ++d) {
-      (*q)[dst + d] = packed_q_gate[src + d];
-      (*gate)[dst + d] = packed_q_gate[src + head_dim + d];
-    }
-  }
-}
-
 int argmax_host(const std::vector<half>& logits) {
   int best = 0;
   float best_v = -1e30f;
@@ -642,14 +625,7 @@ void QwenMiniModel::run_full_attention_block(const LayerWeights& weights, LayerC
   const int q_proj_dim = q_dim * 2;
 
   gemv(x_norm_, weights.wq, cfg_.hidden_size, q_proj_dim, linear_mixed_qkv_);
-
-  std::vector<half> packed_q_gate(q_proj_dim);
-  std::vector<half> q_host;
-  std::vector<half> gate_host;
-  CUDA_CHECK(cudaMemcpy(packed_q_gate.data(), linear_mixed_qkv_, q_proj_dim * sizeof(half), cudaMemcpyDeviceToHost));
-  split_q_and_gate(packed_q_gate, cfg_.num_heads, head_dim, &q_host, &gate_host);
-  CUDA_CHECK(cudaMemcpy(q_, q_host.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(q_gate_, gate_host.data(), q_dim * sizeof(half), cudaMemcpyHostToDevice));
+  launch_split_q_gate_interleaved(linear_mixed_qkv_, cfg_.num_heads, head_dim, q_, q_gate_);
 
   gemv(x_norm_, weights.wk, cfg_.hidden_size, kv_dim, k_);
   gemv(x_norm_, weights.wv, cfg_.hidden_size, kv_dim, v_);
@@ -875,6 +851,7 @@ std::vector<int> QwenMiniModel::generate(const std::vector<int>& input_ids, int 
                                          float presence_penalty, float frequency_penalty,
                                          float repetition_penalty,
                                          int dump_topk, int dump_steps,
+                                         bool stream_ids,
                                          float* elapsed_ms) {
   if (!loaded_) {
     throw std::runtime_error("Model not loaded");
@@ -922,6 +899,10 @@ std::vector<int> QwenMiniModel::generate(const std::vector<int>& input_ids, int 
       }
     }
     all.push_back(next);
+    if (stream_ids) {
+      std::cout << "stream_token_id=" << next << "\n";
+      std::cout.flush();
+    }
     cur = next;
     ++pos;
     if (next == eos_id) {

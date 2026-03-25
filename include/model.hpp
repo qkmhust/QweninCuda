@@ -46,6 +46,7 @@ class QwenMiniModel {
                             float repetition_penalty = 1.1f,
                             int dump_topk = 0,
                             int dump_steps = 0,
+                            bool stream_ids = false,
                             float* elapsed_ms = nullptr);
 
   const QwenMiniConfig& config() const { return cfg_; }

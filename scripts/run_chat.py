@@ -2,6 +2,7 @@
 import argparse
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from transformers import AutoTokenizer
@@ -25,7 +26,7 @@ def parse_perf_metrics(output: str):
     }
 
 
-def run_engine_once(args, tokenizer, input_ids: list[int]):
+def run_engine_once(args, tokenizer, input_ids: list[int], on_token_id=None):
     input_ids_str = ",".join(str(x) for x in input_ids)
     cmd = [
         args.engine,
@@ -59,10 +60,42 @@ def run_engine_once(args, tokenizer, input_ids: list[int]):
         str(args.repetition_penalty),
     ]
 
+    if args.stream:
+        cmd.append("--stream-ids")
+
+    if args.stream and on_token_id is not None:
+        proc = subprocess.Popen(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+        )
+        stdout_lines = []
+        first_token_at = None
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            m = re.match(r"^stream_token_id=([-0-9]+)\s*$", line.strip())
+            if m:
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
+                on_token_id(int(m.group(1)))
+
+        stderr_text = ""
+        if proc.stderr is not None:
+            stderr_text = proc.stderr.read()
+        code = proc.wait()
+        out = "".join(stdout_lines) + "\n" + stderr_text
+        if code != 0:
+            raise subprocess.CalledProcessError(code, cmd, output=out)
+        gen_ids = parse_generated_ids(out)
+        return out, gen_ids, first_token_at
+
     proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
     out = proc.stdout + "\n" + proc.stderr
     gen_ids = parse_generated_ids(out)
-    return out, gen_ids
+    return out, gen_ids, None
 
 
 def remove_think_block(text: str) -> str:
@@ -167,22 +200,51 @@ def display_response(tokenizer, input_ids: list[int], gen_ids: list[int], keep_t
 
 def run_single_turn(args, tokenizer):
     input_ids = build_input_ids(tokenizer, args.prompt, args.system_prompt)
-    out, gen_ids = run_engine_once(args, tokenizer, input_ids)
+    print("=== prompt ===")
+    print(args.prompt)
+    if args.stream:
+        print("=== response(stream) ===")
+
+    stream_ids: list[int] = []
+    stream_text = ""
+    t_begin = time.perf_counter()
+
+    def on_token_id(tid: int):
+        nonlocal stream_text
+        stream_ids.append(tid)
+        # 增量显示：每来一个 token id 就重新 decode 并输出新增片段。
+        text = tokenizer.decode(stream_ids, skip_special_tokens=True)
+        if text.startswith(stream_text):
+            delta = text[len(stream_text) :]
+        else:
+            delta = text
+        if delta:
+            print(delta, end="", flush=True)
+        stream_text = text
+
+    out, gen_ids, first_token_at = run_engine_once(
+        args, tokenizer, input_ids, on_token_id=on_token_id if args.stream else None
+    )
 
     if args.show_engine_output:
         print(out)
 
     text = display_response(tokenizer, input_ids, gen_ids, args.keep_think)
     metrics = parse_perf_metrics(out)
-    print("=== prompt ===")
-    print(args.prompt)
-    print("=== response ===")
-    print(text)
+    if args.stream:
+        # 流式输出内容已在回调中逐步打印，这里补一个换行保证版式稳定。
+        print()
+    else:
+        print("=== response ===")
+        print(text)
     if metrics is not None:
         print(
             f"=== perf === elapsed_ms={metrics['elapsed_ms']:.2f} "
             f"new_tokens={metrics['new_tokens']} tok_per_s={metrics['tok_per_s']:.2f}"
         )
+    if args.stream and first_token_at is not None:
+        ttft_ms = (first_token_at - t_begin) * 1000.0
+        print(f"=== stream === ttft_ms={ttft_ms:.2f}")
 
 
 def run_interactive(args, tokenizer):
@@ -237,17 +299,43 @@ def run_interactive(args, tokenizer):
                 break
             sliced_history = sliced_history[1:]
 
-        out, gen_ids = run_engine_once(args, tokenizer, input_ids)
+        stream_ids: list[int] = []
+        stream_text = ""
+
+        def on_token_id(tid: int):
+            nonlocal stream_text
+            stream_ids.append(tid)
+            text_now = tokenizer.decode(stream_ids, skip_special_tokens=True)
+            if text_now.startswith(stream_text):
+                delta = text_now[len(stream_text) :]
+            else:
+                delta = text_now
+            if delta:
+                print(delta, end="", flush=True)
+            stream_text = text_now
+
+        if args.stream:
+            print("助手: ", end="", flush=True)
+        out, gen_ids, _ = run_engine_once(
+            args, tokenizer, input_ids, on_token_id=on_token_id if args.stream else None
+        )
 
         if args.show_engine_output:
             print(out)
 
         answer = display_response(tokenizer, input_ids, gen_ids, args.keep_think)
         metrics = parse_perf_metrics(out)
-        if metrics is not None:
-            print(f"助手 [{metrics['tok_per_s']:.2f} tok/s]: {answer}")
+        if args.stream:
+            print()
+            if metrics is not None:
+                print(f"[perf] {metrics['tok_per_s']:.2f} tok/s")
+            else:
+                print("[perf] n/a")
         else:
-            print(f"助手: {answer}")
+            if metrics is not None:
+                print(f"助手 [{metrics['tok_per_s']:.2f} tok/s]: {answer}")
+            else:
+                print(f"助手: {answer}")
         history.append((user_prompt, answer))
         turn += 1
 
@@ -263,6 +351,7 @@ def main():
     parser.add_argument("--history-turns", type=int, default=6, help="How many history turns to keep in context")
     parser.add_argument("--max-input-tokens", type=int, default=1024, help="Hard cap for input context tokens in interactive mode")
     parser.add_argument("--show-engine-output", action="store_true", help="Print full engine raw output")
+    parser.add_argument("--stream", action="store_true", help="Stream tokens while engine is generating")
     parser.add_argument(
         "--system-prompt",
         default=(

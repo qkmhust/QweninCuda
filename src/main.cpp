@@ -47,6 +47,7 @@ struct CliArgs {
   float presence_penalty = 0.0f;
   float frequency_penalty = 0.0f;
   float repetition_penalty = 1.1f;
+  bool stream_ids = false;
   int dump_topk = 0;
   int dump_steps = 0;
 };
@@ -119,6 +120,8 @@ CliArgs parse_args(int argc, char** argv) {
     } else if (k == "--dump-steps") {
       need_value(i, k);
       args.dump_steps = std::stoi(argv[++i]);
+    } else if (k == "--stream-ids") {
+      args.stream_ids = true;
     } else if (k == "-h" || k == "--help") {
       usage();
       std::exit(0);
@@ -153,7 +156,8 @@ int main(int argc, char** argv) {
       model.generate(input_ids, args.max_new_tokens, args.eos_id, args.temperature, args.top_k,
                      args.top_p, args.min_p, args.temp_decay, args.greedy_after,
                      args.no_repeat_ngram_size, args.presence_penalty, args.frequency_penalty,
-                     args.repetition_penalty, args.dump_topk, args.dump_steps, &elapsed_ms);
+                       args.repetition_penalty, args.dump_topk, args.dump_steps, args.stream_ids,
+                       &elapsed_ms);
 
     int new_tokens = static_cast<int>(output_ids.size() - input_ids.size());
     float tps = (new_tokens > 0 && elapsed_ms > 0.0f) ? (1000.0f * new_tokens / elapsed_ms) : 0.0f;

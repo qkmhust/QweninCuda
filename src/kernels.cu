@@ -111,6 +111,21 @@ __global__ void head_rmsnorm_kernel(const half* x, const half* weight, int num_h
   }
 }
 
+__global__ void split_q_gate_interleaved_kernel(const half* packed_q_gate, int num_heads, int head_dim,
+                                                half* q, half* gate) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_heads * head_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  int h = idx / head_dim;
+  int d = idx % head_dim;
+  int base = h * (2 * head_dim);
+  q[idx] = packed_q_gate[base + d];
+  gate[idx] = packed_q_gate[base + head_dim + d];
+}
+
 __global__ void add_inplace_kernel(half* x, const half* y, int n) {
   // 输入/输出都在 x 上原地进行，减少额外显存占用。
   // 最简单的残差加法：x = x + y。
@@ -378,6 +393,14 @@ void launch_head_rmsnorm(const half* x, const half* weight, int num_heads, int h
                          half* out) {
   // 一头一个 block，便于理解 head-wise 的并行映射。
   head_rmsnorm_kernel<<<num_heads, 256>>>(x, weight, num_heads, head_dim, eps, out);
+}
+
+void launch_split_q_gate_interleaved(const half* packed_q_gate, int num_heads, int head_dim,
+                                     half* q, half* gate) {
+  int total = num_heads * head_dim;
+  int threads = 256;
+  int blocks = (total + threads - 1) / threads;
+  split_q_gate_interleaved_kernel<<<blocks, threads>>>(packed_q_gate, num_heads, head_dim, q, gate);
 }
 
 void launch_add_inplace(half* x, const half* y, int n) {
